@@ -1,0 +1,13 @@
+.env
+.mfp_cookies.json
+.summary_sent
+.claude/
+venv/
+__pycache__/
+.chrome_profile/
+.mfp_chrome_profile/
+debug_*.html
+tmp_*.html
+chromedriver.log
+*.pyc
+.DS_Store

@@ -1,0 +1,1549 @@
+#!/usr/bin/env python3
+"""
+Diet Assistant — Conversational food logger for MyFitnessPal.
+
+Talks to you about meals, understands natural language ("I had a protein bar
+and chai"), matches against your MFP recent foods, and logs them.
+
+Modes:
+  python assistant.py              — Terminal chat mode
+  python assistant.py --sms        — Twilio SMS server mode (coming soon)
+
+Requires: OPENAI_API_KEY in .env
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import argparse
+from datetime import date, datetime, timedelta
+
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# Import MFP functions from the existing script
+from myfitnesspal import (
+    MEALS,
+    create_session,
+    check_meals_logged,
+    get_diary_details,
+    get_recent_foods,
+    search_foods,
+    log_foods,
+    log_searched_food,
+    remove_food,
+    send_sms,
+    build_daily_summary,
+    load_presets,
+    save_presets,
+    get_preset_names,
+    get_preset,
+    quick_add_food,
+)
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
+
+USER_NAME = os.getenv("USER_NAME", "Aaran")
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+MEAL_NAMES_TO_IDX = {info["name"].lower(): idx for idx, info in MEALS.items()}
+
+
+# ── Voice + reminders ──────────────────────────────────────────────────────
+
+def parse_reminder_times(raw):
+    """Parse comma-separated HH:MM values."""
+    if not raw:
+        return []
+
+    parsed = []
+    for token in raw.split(","):
+        t = token.strip()
+        if not t:
+            continue
+        try:
+            datetime.strptime(t, "%H:%M")
+            parsed.append(t)
+        except ValueError:
+            print(f"Skipping invalid reminder time: {t} (expected HH:MM)")
+    return sorted(set(parsed))
+
+
+class Speaker:
+    """Simple TTS wrapper that uses local OS commands."""
+    def __init__(self, enabled=False, voice_name=None):
+        self.enabled = enabled
+        self.voice_name = voice_name
+        self.backend = None
+
+        if not enabled:
+            return
+
+        if shutil.which("say"):
+            self.backend = "say"
+        elif shutil.which("espeak"):
+            self.backend = "espeak"
+        else:
+            print("Voice mode enabled, but no TTS backend found (`say`/`espeak`).")
+            self.enabled = False
+
+    def speak(self, text):
+        if not self.enabled or not text:
+            return
+        try:
+            if self.backend == "say":
+                cmd = ["say"]
+                if self.voice_name:
+                    cmd += ["-v", self.voice_name]
+                cmd.append(text)
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif self.backend == "espeak":
+                cmd = ["espeak"]
+                if self.voice_name:
+                    cmd += ["-v", self.voice_name]
+                cmd.append(text)
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+class AssistantSpeechInterceptor:
+    """Intercept stdout and speak lines that contain `Assistant:`."""
+    def __init__(self, wrapped, speaker):
+        self.wrapped = wrapped
+        self.speaker = speaker
+        self._buffer = ""
+
+    def write(self, data):
+        self.wrapped.write(data)
+        self._buffer += data
+
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if "Assistant:" in line:
+                spoken = line.split("Assistant:", 1)[1].strip()
+                self.speaker.speak(spoken)
+
+    def flush(self):
+        self.wrapped.flush()
+
+
+def start_reminder_loop(session, reminder_times, stop_event, snooze_state):
+    """Background reminders — only fires for the specific meal at each time.
+
+    reminder_times: list of "HH:MM" strings (e.g. ["09:30", "13:30", "19:30"])
+    snooze_state: dict shared with main thread. Keys are meal_idx (int),
+                  values are datetime of when to re-check after a user deferral.
+
+    Mapping: reminder_times[0] → Breakfast(0), [1] → Lunch(1), [2] → Dinner(2).
+    Extra times beyond 3 remind for any unlogged meal (legacy behavior).
+    """
+    if not reminder_times:
+        return
+
+    # Map each reminder time to its meal index
+    MEAL_TIME_MAP = {}
+    for i, t in enumerate(reminder_times):
+        if i < 3:
+            MEAL_TIME_MAP[t] = i  # 0=Breakfast, 1=Lunch, 2=Dinner
+        # Extra times (if any) won't get a specific meal assignment
+
+    fired_today = set()
+
+    def _check_meal_logged(meal_idx):
+        """Check if a specific meal has been logged today."""
+        try:
+            logged = check_meals_logged(session, date.today())
+            return logged.get(meal_idx, False)
+        except Exception:
+            return False
+
+    def _loop():
+        while not stop_event.is_set():
+            now = datetime.now()
+            day_key = now.strftime("%Y-%m-%d")
+            hhmm = now.strftime("%H:%M")
+
+            # Reset fired set on new day
+            if fired_today and not any(k.startswith(day_key) for k in fired_today):
+                fired_today.clear()
+                snooze_state.clear()
+
+            # ── Check scheduled reminder times ──
+            slot_key = f"{day_key} {hhmm}"
+            if hhmm in MEAL_TIME_MAP and slot_key not in fired_today:
+                meal_idx = MEAL_TIME_MAP[hhmm]
+                meal_name = MEALS[meal_idx]["name"]
+                if not _check_meal_logged(meal_idx):
+                    fired_today.add(slot_key)
+                    print(f"\n  Assistant: Hey, you haven't logged {meal_name.lower()} yet. What did you have?\n")
+
+            # ── Check snoozed meals ──
+            for meal_idx in list(snooze_state.keys()):
+                wake_time = snooze_state[meal_idx]
+                if now >= wake_time:
+                    del snooze_state[meal_idx]
+                    meal_name = MEALS[meal_idx]["name"]
+                    if not _check_meal_logged(meal_idx):
+                        print(f"\n  Assistant: Checking back — did you end up having {meal_name.lower()}?\n")
+                    # else: meal was logged, no need to remind
+
+            stop_event.wait(20)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+
+SUMMARY_SENT_FILE = os.path.join(SCRIPT_DIR, ".summary_sent")
+
+
+def _was_summary_sent_today():
+    """Check if summary was already sent today by reading the marker file."""
+    try:
+        with open(SUMMARY_SENT_FILE, "r") as f:
+            last_date = f.read().strip()
+        return last_date == date.today().isoformat()
+    except (FileNotFoundError, ValueError):
+        return False
+
+
+def _mark_summary_sent():
+    """Write today's date to the marker file."""
+    with open(SUMMARY_SENT_FILE, "w") as f:
+        f.write(date.today().isoformat())
+
+
+def start_nightly_summary_loop(session, summary_time, stop_event):
+    """Background thread that texts a daily diet summary at the configured time.
+    If the target time was missed (e.g. laptop was closed), sends as soon as
+    the program is running again, as long as it's still the same day.
+    Uses a marker file so it only sends once per day even across restarts."""
+    if not summary_time:
+        return
+
+    # Normalize to HH:MM (zero-padded) so "8:52" becomes "08:52"
+    try:
+        h, m = summary_time.split(":")
+        target_h, target_m = int(h), int(m)
+        summary_time = f"{target_h:02d}:{target_m:02d}"
+    except (ValueError, AttributeError):
+        print(f"  [summary] Invalid time format: {summary_time}. Use HH:MM.")
+        return
+
+    def _send_summary():
+        """Build and send the daily summary. Returns True if sent."""
+        try:
+            msg = build_daily_summary(session)
+            if msg:
+                ok = send_sms(msg)
+                if ok:
+                    _mark_summary_sent()
+                    print(f"\n  Assistant: Sent your nightly diet summary!\n")
+                    return True
+                else:
+                    print(f"\n  Assistant: Couldn't send summary. Check config.\n")
+            else:
+                print(f"\n  Assistant: No diary data to summarize today.\n")
+        except Exception as e:
+            print(f"\n  Assistant: Error building summary: {e}\n")
+        return False
+
+    def _loop():
+        print(f"  [summary] Loop started at {datetime.now().strftime('%H:%M:%S')}, "
+              f"daily summary at {summary_time}")
+        while not stop_event.is_set():
+            now = datetime.now()
+            current_h, current_m = now.hour, now.minute
+
+            # Check if it's at or past the target time and before midnight
+            past_target = (current_h > target_h or
+                           (current_h == target_h and current_m >= target_m))
+
+            if past_target and not _was_summary_sent_today():
+                print(f"  [summary] Triggering daily summary at {now.strftime('%H:%M:%S')}...")
+                _send_summary()
+
+            stop_event.wait(30)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+
+# ── GPT helpers ───────────────────────────────────────────────────────────
+
+def parse_user_message(user_message):
+    """
+    Ask GPT to extract the meal type and food description from a casual message.
+    Returns: {"meal": str|null, "foods": str|null, "intent": str, ...}
+    """
+    preset_names = get_preset_names()
+    presets_hint = ""
+    if preset_names:
+        presets_hint = f"\nThe user has these saved meal presets: {', '.join(preset_names)}\n"
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You parse casual messages about food logging. Extract the meal type and food description.\n"
+                    f"{presets_hint}\n"
+                    "Return ONLY a JSON object with these fields:\n"
+                    '- "meal": one of "breakfast", "lunch", "dinner", "snacks", or null if not mentioned\n'
+                    '- "foods": the food description extracted from their message, or null\n'
+                    '- "intent": one of the following:\n'
+                    '  - "log": log/add individual food(s)\n'
+                    '  - "remove": remove/delete food from diary\n'
+                    '  - "skip": skip a meal / haven\'t eaten\n'
+                    '  - "create_meal": create/save a new meal preset '
+                    '(e.g. "create a meal called lunch combo", "save a meal preset")\n'
+                    '  - "log_meal": log a saved meal preset '
+                    '(e.g. "log my lunch combo", "log the chicken and rice meal")\n'
+                    '  - "manage_meal": view/edit/delete meal presets '
+                    '(e.g. "show my meals", "delete lunch combo", "add rice to lunch combo")\n'
+                    '  - "quick_add": user specifies exact calories/macros to log directly '
+                    '(e.g. "quick add 1500 cals 88g fat 77g protein to dinner", '
+                    '"I had mod pizza, 1500 calories, 88g fat, 77g protein for dinner")\n'
+                    '  - "defer": user wants to eat/log later, postpone '
+                    '(e.g. "I\'ll eat later", "I\'ll do it later", "not yet", "haven\'t eaten yet", "remind me later")\n'
+                    '  - "chat": anything else (questions, greetings, etc.)\n'
+                    '- "preset_name": the meal preset name (for create_meal, log_meal, manage_meal), or null\n'
+                    '- "sub_action": for manage_meal only — "list", "delete", "add_food", "remove_food", or null\n'
+                    '- "calories": number or null (for quick_add)\n'
+                    '- "protein": number or null (for quick_add)\n'
+                    '- "fat": number or null (for quick_add)\n'
+                    '- "carbs": number or null (for quick_add)\n\n'
+                    "Examples:\n"
+                    '- "had a protein bar and chai for breakfast" → {"meal": "breakfast", "foods": "protein bar and chai", "intent": "log", "preset_name": null, "sub_action": null}\n'
+                    '- "protein bar and chai" → {"meal": null, "foods": "protein bar and chai", "intent": "log", "preset_name": null, "sub_action": null}\n'
+                    '- "remove the chicken from dinner" → {"meal": "dinner", "foods": "chicken", "intent": "remove", "preset_name": null, "sub_action": null}\n'
+                    '- "skipped breakfast" → {"meal": "breakfast", "foods": null, "intent": "skip", "preset_name": null, "sub_action": null}\n'
+                    '- "create a meal called lunch combo" → {"meal": null, "foods": null, "intent": "create_meal", "preset_name": "lunch combo", "sub_action": null}\n'
+                    '- "save a meal preset called morning fuel with eggs and toast" → {"meal": null, "foods": "eggs and toast", "intent": "create_meal", "preset_name": "morning fuel", "sub_action": null}\n'
+                    '- "log my lunch combo for lunch" → {"meal": "lunch", "foods": null, "intent": "log_meal", "preset_name": "lunch combo", "sub_action": null}\n'
+                    '- "log the chicken and rice" → {"meal": null, "foods": null, "intent": "log_meal", "preset_name": "chicken and rice", "sub_action": null}\n'
+                    '- "show my meals" → {"meal": null, "foods": null, "intent": "manage_meal", "preset_name": null, "sub_action": "list"}\n'
+                    '- "what meal presets do I have" → {"meal": null, "foods": null, "intent": "manage_meal", "preset_name": null, "sub_action": "list"}\n'
+                    '- "delete the lunch combo" → {"meal": null, "foods": null, "intent": "manage_meal", "preset_name": "lunch combo", "sub_action": "delete"}\n'
+                    '- "add rice to lunch combo" → {"meal": null, "foods": "rice", "intent": "manage_meal", "preset_name": "lunch combo", "sub_action": "add_food"}\n'
+                    '- "remove sauce from lunch combo" → {"meal": null, "foods": "sauce", "intent": "manage_meal", "preset_name": "lunch combo", "sub_action": "remove_food"}\n'
+                    '- "how many calories today" → {"meal": null, "foods": null, "intent": "chat", "preset_name": null, "sub_action": null}\n'
+                    '- "what is logged for dinner" → {"meal": "dinner", "foods": null, "intent": "chat", "preset_name": null, "sub_action": null}\n'
+                    '- "what does my dinner show" → {"meal": "dinner", "foods": null, "intent": "chat", "preset_name": null, "sub_action": null}\n'
+                    '- "what did I log today" → {"meal": null, "foods": null, "intent": "chat", "preset_name": null, "sub_action": null}\n'
+                    '- "clear my dinner log" → {"meal": "dinner", "foods": null, "intent": "remove", "preset_name": null, "sub_action": null}\n'
+                    '- "clear everything from lunch" → {"meal": "lunch", "foods": null, "intent": "remove", "preset_name": null, "sub_action": null}\n'
+                    '- "i had mod pizza, 1500 calories, 88g fat, 77g protein for dinner" → {"meal": "dinner", "foods": "mod pizza", "intent": "quick_add", "preset_name": null, "sub_action": null, "calories": 1500, "fat": 88, "protein": 77, "carbs": null}\n'
+                    '- "quick add 500 cals 30g protein to lunch" → {"meal": "lunch", "foods": "Quick Add", "intent": "quick_add", "preset_name": null, "sub_action": null, "calories": 500, "protein": 30, "fat": null, "carbs": null}\n'
+                    '- "I\'ll eat later" → {"meal": null, "foods": null, "intent": "defer", "preset_name": null, "sub_action": null}\n'
+                    '- "not yet, remind me later" → {"meal": null, "foods": null, "intent": "defer", "preset_name": null, "sub_action": null}\n'
+                    '- "I\'ll log lunch later" → {"meal": "lunch", "foods": null, "intent": "defer", "preset_name": null, "sub_action": null}\n'
+                    "\nIMPORTANT:\n"
+                    "- Questions about what's LOGGED/in the diary (e.g. 'what did I log', 'what's in my dinner') = chat, NOT manage_meal.\n"
+                    "- manage_meal is ONLY for meal PRESETS (saved combos), not the diary.\n"
+                    "- If the user mentions a saved preset name, use log_meal (not log).\n"
+                    "- If the user provides SPECIFIC calorie/macro numbers for a food, use quick_add (not log). "
+                    'Put the food name in "foods" (e.g. "mod pizza"). If no food name given, use "Quick Add".\n'
+                    "Return ONLY the JSON object, nothing else."
+                ),
+            },
+            {"role": "user", "content": user_message},
+        ],
+    )
+
+    raw = response.choices[0].message.content.strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return {"meal": None, "foods": None, "intent": "chat"}
+
+
+def match_foods_with_gpt(food_description, food_list):
+    """
+    Ask GPT to match user's food description to MFP recent foods.
+    Returns a list of {"description": str, "matches": [int]}.
+    """
+    food_names = [f"{i}: {f['name']}" for i, f in enumerate(food_list)]
+    food_list_str = "\n".join(food_names)
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a food-matching assistant. The user describes what they ate. "
+                    "You have a numbered list of their MyFitnessPal recent foods.\n\n"
+                    "Break the user's message into INDIVIDUAL food items, then find the best match for each.\n\n"
+                    "Return a JSON array of objects, one per food item the user mentioned:\n"
+                    '[{"description": "what they said", "matches": [index_numbers]}]\n\n'
+                    "Rules:\n"
+                    "- Each food item the user mentioned gets its own object\n"
+                    "- If there's ONE clear best match, return just that index: [5]\n"
+                    "- If there are MULTIPLE similar options (e.g. 'protein shake' could be index 5 or 18), "
+                    "return all candidates: [5, 18] — the user will pick\n"
+                    "- If no match exists, return empty: []\n"
+                    "- Match loosely: 'protein bar' matches anything with 'protein' and 'bar'\n"
+                    "- 'chai' matches 'Chai Lucerne - Chai'\n"
+                    '- "protein bar and chai" → two separate items\n'
+                    '- "protein shake" with two shake options → one item with two matches\n'
+                    "- Return ONLY the JSON array, nothing else"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"I ate: {food_description}\n\n"
+                    f"Available foods:\n{food_list_str}"
+                ),
+            },
+        ],
+    )
+
+    raw = response.choices[0].message.content.strip()
+    try:
+        result = json.loads(raw)
+        if isinstance(result, list):
+            for item in result:
+                if "matches" in item:
+                    item["matches"] = [i for i in item["matches"] if isinstance(i, int) and 0 <= i < len(food_list)]
+            return result
+    except json.JSONDecodeError:
+        pass
+    return []
+
+
+def match_search_results_with_gpt(food_description, search_results):
+    """
+    Ask GPT to pick the best match from MFP search results for a single food.
+    Returns (matched_food_dict, confidence) or (None, "none").
+    """
+    food_names = [
+        f"{i}: {f['name']}" + (f" ({f['cal_info']})" if f.get("cal_info") else "")
+        for i, f in enumerate(search_results)
+    ]
+    food_list_str = "\n".join(food_names)
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You pick the SINGLE best match from MFP search results for a food item.\n\n"
+                    'Return ONLY a JSON object: {"match": index_number, "confidence": "high"|"medium"|"low"}\n'
+                    'If nothing matches well, return: {"match": null, "confidence": "none"}\n\n'
+                    "Rules:\n"
+                    "- Prefer generic entries over branded unless user specified a brand\n"
+                    "- Prefer verified/common entries\n"
+                    "- Return ONLY the JSON object"
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Looking for: {food_description}\n\nSearch results:\n{food_list_str}",
+            },
+        ],
+    )
+
+    raw = response.choices[0].message.content.strip()
+    try:
+        result = json.loads(raw)
+        idx = result.get("match")
+        if idx is not None and isinstance(idx, int) and 0 <= idx < len(search_results):
+            return search_results[idx], result.get("confidence", "medium")
+    except json.JSONDecodeError:
+        pass
+    return None, "none"
+
+
+def split_food_descriptions(food_description):
+    """Split a free-form food phrase into likely individual food items."""
+    parts = re.split(r",| and | with |\+", food_description, flags=re.IGNORECASE)
+    cleaned = [p.strip() for p in parts if p and p.strip()]
+    return cleaned or [food_description.strip()]
+
+
+def normalize_food_query(food_text):
+    """Strip conversational quantity words so search uses a cleaner food name."""
+    q = food_text.strip().lower()
+    q = re.sub(r"^(can you )?(just )?(log|add)\s+", "", q)
+    q = re.sub(r"^(a|an|the|some)\s+", "", q)
+    q = re.sub(r"^(regular|normal|standard)\s+(serving|portion)\s+of\s+", "", q)
+    q = re.sub(r"^(serving|portion)\s+of\s+", "", q)
+    q = re.sub(r"\s+", " ", q).strip(" .")
+    return q or food_text.strip()
+
+
+def pick_reasonable_search_result(search_query, search_results):
+    """Heuristic fallback when GPT confidence is low on search matches."""
+    q = search_query.lower().strip()
+    best = None
+    best_score = -10**9
+
+    for item in search_results:
+        name = item.get("name", "").strip()
+        if not name:
+            continue
+        lower = name.lower()
+        score = 0
+
+        if lower == q:
+            score += 8
+        if lower.startswith(q):
+            score += 5
+        if q in lower:
+            score += 3
+        if " - " in name:
+            score -= 3
+        if any(tag in lower for tag in ("raw", "cooked", "steamed", "roasted")):
+            score += 1
+
+        if score > best_score:
+            best_score = score
+            best = item
+
+    return best
+
+
+def smart_reply(user_input, diary_context):
+    """Let GPT answer a question using diary data."""
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.5,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    f"You are a concise diet assistant for {USER_NAME}. "
+                    f"Answer their question based on the diary data below. "
+                    f"Be short and direct — 1-2 sentences max. "
+                    f"Don't dump the whole diary unless they specifically ask for a full summary. "
+                    f"If they ask about a specific food, just answer yes/no and which meal it's in. "
+                    f"If they ask about calories/protein remaining, give just the numbers.\n\n"
+                    f"{diary_context}"
+                ),
+            },
+            {"role": "user", "content": user_input},
+        ],
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ── Meal state tracking ───────────────────────────────────────────────────
+
+def get_unlogged_meals(session):
+    """Return list of (meal_idx, meal_name) that haven't been logged today."""
+    logged = check_meals_logged(session, date.today())
+    return [(idx, info["name"]) for idx, info in MEALS.items() if not logged.get(idx, False)]
+
+
+def guess_meal_from_time():
+    """Guess which meal the user is probably talking about based on time."""
+    hour = datetime.now().hour
+    if hour < 11:
+        return 0   # Breakfast
+    elif hour < 18:
+        return 1   # Lunch (noon–6 PM)
+    else:
+        return 2   # Dinner (after 6 PM)
+
+
+def resolve_meal_idx(mentioned_meal, unlogged):
+    """Figure out which meal index the user means."""
+    if mentioned_meal and mentioned_meal in MEAL_NAMES_TO_IDX:
+        return MEAL_NAMES_TO_IDX[mentioned_meal]
+
+    unlogged_indices = [idx for idx, _ in unlogged]
+    if len(unlogged_indices) == 1:
+        return unlogged_indices[0]
+
+    guessed = guess_meal_from_time()
+    if guessed in unlogged_indices:
+        return guessed
+    if unlogged_indices:
+        return unlogged_indices[0]
+    return guessed
+
+
+def build_diary_context(session):
+    """Build a text summary of today's diary for GPT."""
+    diary, summary = get_diary_details(session, date.today())
+    unlogged = get_unlogged_meals(session)
+    totals = summary.get("totals", {})
+    goal = summary.get("goal", {})
+    remaining = summary.get("remaining", {})
+
+    lines = []
+    for meal_idx, info in MEALS.items():
+        foods = diary.get(meal_idx, [])
+        if foods:
+            food_names = ", ".join(f["name"] for f in foods)
+            lines.append(f"{info['name']}: {food_names}")
+        else:
+            lines.append(f"{info['name']}: (nothing logged)")
+
+    unlogged_names = ", ".join(n for _, n in unlogged) if unlogged else "none"
+
+    return (
+        f"Today's diary:\n" + "\n".join(lines) + "\n\n"
+        f"Totals: {totals.get('calories', '?')} cal, "
+        f"{totals.get('carbs', '?')}g carbs, "
+        f"{totals.get('fat', '?')}g fat, "
+        f"{totals.get('protein', '?')}g protein\n"
+        f"Daily goal: {goal.get('calories', '?')} cal, {goal.get('protein', '?')}g protein\n"
+        f"Remaining: {remaining.get('calories', '?')} cal, {remaining.get('protein', '?')}g protein\n"
+        f"Unlogged meals: {unlogged_names}"
+    )
+
+
+# ── Terminal chat mode ────────────────────────────────────────────────────
+
+def run_terminal_chat(reminder_times=None, summary_time=None):
+    """Interactive terminal chat — the assistant asks about meals."""
+    print(f"\n{'═' * 50}")
+    print(f"  Diet Assistant for {USER_NAME}")
+    print(f"  {datetime.now().strftime('%A, %B %d %Y — %I:%M %p')}")
+    print(f"{'═' * 50}\n")
+
+    session = create_session()
+    reminder_stop = threading.Event()
+    summary_stop = threading.Event()
+    snooze_state = {}  # shared with reminder thread: {meal_idx: datetime_to_recheck}
+    start_reminder_loop(session, reminder_times or [], reminder_stop, snooze_state)
+    start_nightly_summary_loop(session, summary_time, summary_stop)
+
+    unlogged = get_unlogged_meals(session)
+
+    if not unlogged:
+        opener = f"Hey {USER_NAME}! All your meals are logged for today. Nice work!"
+    else:
+        opener = f"Hey {USER_NAME}! Would you like to log any food?"
+    print(f"  Assistant: {opener}\n")
+
+    # ── State ──
+    pending_meal_idx = None
+    last_meal_idx = None        # remembers the meal even after reset (for follow-up)
+    pending_foods = []          # resolved foods ready to log
+    pending_searched_foods = [] # foods resolved via MFP search fallback
+    pending_search_metadata = None  # token/date from search_foods (for log_searched_food)
+    pending_quantity = "1"      # number of servings to log (adjustable via corrections)
+    pending_all_foods = None    # all MFP foods for this meal (needed for POST)
+    pending_metadata = None
+    disambiguation_queue = []   # list of {"description": str, "options": [food_dicts]}
+    not_found = []              # food descriptions with no match
+    awaiting_confirmation = False
+    awaiting_pick = False
+    pick_options = []
+
+    def reset_state():
+        nonlocal pending_meal_idx, pending_foods, pending_searched_foods, pending_search_metadata
+        nonlocal pending_all_foods, pending_metadata, pending_quantity
+        nonlocal disambiguation_queue, not_found, awaiting_confirmation, awaiting_pick, pick_options
+        pending_meal_idx = None
+        pending_foods = []
+        pending_searched_foods = []
+        pending_search_metadata = None
+        pending_quantity = "1"
+        pending_all_foods = None
+        pending_metadata = None
+        disambiguation_queue = []
+        not_found = []
+        awaiting_confirmation = False
+        awaiting_pick = False
+        pick_options = []
+
+    def process_next_disambiguation():
+        """Pop the next ambiguous item and ask the user to pick."""
+        nonlocal awaiting_pick, pick_options, awaiting_confirmation
+        if disambiguation_queue:
+            item = disambiguation_queue.pop(0)
+            options = item["options"]
+            desc = item["description"]
+            print(f"\n  Assistant: Which \"{desc}\" did you mean?")
+            for i, opt in enumerate(options, 1):
+                print(f"    [{i}] {opt['name']}")
+            print()
+            awaiting_pick = True
+            pick_options = options
+        else:
+            # All disambiguations resolved — go to confirmation
+            show_confirmation()
+
+    def show_confirmation():
+        """Show all resolved foods and ask to confirm."""
+        nonlocal awaiting_confirmation
+        if not pending_foods and not pending_searched_foods:
+            if not_found:
+                descs = ", ".join(not_found)
+                print(f"\n  Assistant: Couldn't find matches for: {descs}")
+                print(f"  Assistant: They might not be in your MFP recents yet.\n")
+            reset_state()
+            return
+
+        meal_name = MEALS[pending_meal_idx]["name"]
+        all_pending_names = [f["name"] for f in pending_foods] + [f["name"] for f in pending_searched_foods]
+        food_names = ", ".join(all_pending_names)
+
+        if not_found:
+            descs = ", ".join(not_found)
+            print(f"\n  Assistant: Heads up — couldn't find: {descs}")
+
+        print(f"\n  Assistant: Ready to log to {meal_name}: {food_names}")
+        print(f"  Assistant: Go ahead? (yes/no)\n")
+        awaiting_confirmation = True
+
+    def commit_pending_logs():
+        """Log both recent-food matches and search-fallback matches."""
+        recent_success = False
+        searched_success_count = 0
+        logged_names = []
+        failed_names = []
+
+        if pending_foods:
+            # Apply quantity override to the all_foods list entries that match selected foods
+            if pending_quantity != "1" and pending_all_foods:
+                selected_ids = {f["food_id"] for f in pending_foods}
+                for f in pending_all_foods:
+                    if f["food_id"] in selected_ids:
+                        f["quantity"] = pending_quantity
+            recent_success = log_foods(session, pending_foods, pending_all_foods, pending_meal_idx, pending_metadata)
+            if recent_success:
+                qty_display = f" (x{pending_quantity})" if pending_quantity != "1" else ""
+                logged_names.extend([f["name"] + qty_display for f in pending_foods])
+            else:
+                failed_names.extend([f["name"] for f in pending_foods])
+
+        for food in pending_searched_foods:
+            if log_searched_food(session, food, pending_meal_idx, pending_search_metadata, quantity=pending_quantity):
+                searched_success_count += 1
+                qty_display = f" (x{pending_quantity})" if pending_quantity != "1" else ""
+                logged_names.append(food["name"] + qty_display)
+            else:
+                failed_names.append(food["name"])
+
+        any_success = len(logged_names) > 0
+        return recent_success, searched_success_count, logged_names, failed_names, any_success
+
+    def start_food_matching(food_desc, meal_idx, rejected_names=None):
+        """Fetch MFP foods and match. Sets up disambiguation queue."""
+        nonlocal pending_meal_idx, pending_foods, pending_searched_foods, pending_search_metadata
+        nonlocal pending_all_foods, pending_metadata
+        nonlocal disambiguation_queue, not_found, last_meal_idx
+
+        last_meal_idx = meal_idx
+        meal_name = MEALS[meal_idx]["name"]
+        print(f"\n  Assistant: Looking up your recent foods for {meal_name}...")
+        all_foods, metadata = get_recent_foods(session, meal_idx)
+
+        # Filter out recently rejected foods so they don't get re-matched
+        if rejected_names and all_foods:
+            rejected_lower = {n.lower() for n in rejected_names}
+            all_foods = [f for f in all_foods if f["name"].lower() not in rejected_lower]
+
+        pending_meal_idx = meal_idx
+        pending_all_foods = all_foods
+        pending_metadata = metadata
+        pending_foods = []
+        pending_searched_foods = []
+        disambiguation_queue = []
+        not_found = []
+
+        if all_foods:
+            match_results = match_foods_with_gpt(food_desc, all_foods)
+            for item in match_results:
+                matches = item.get("matches", [])
+                desc = item.get("description", "")
+
+                if len(matches) == 1:
+                    pending_foods.append(all_foods[matches[0]])
+                elif len(matches) > 1:
+                    disambiguation_queue.append({
+                        "description": desc,
+                        "options": [all_foods[i] for i in matches],
+                    })
+                else:
+                    not_found.append(desc)
+
+            if not match_results:
+                not_found.extend(split_food_descriptions(food_desc))
+        else:
+            print(f"  Assistant: No recent foods found for {meal_name}. Trying full MFP search...")
+            not_found.extend(split_food_descriptions(food_desc))
+
+        # Search fallback for items not in recents
+        still_not_found = []
+        for desc in not_found:
+            search_query = normalize_food_query(desc)
+            print(f"  Assistant: \"{desc}\" isn't in your recents. Searching MFP for \"{search_query}\"...")
+            search_results, search_meta = search_foods(session, search_query, meal_idx)
+            if search_meta and not pending_search_metadata:
+                pending_search_metadata = search_meta
+            if search_results:
+                best_match, confidence = match_search_results_with_gpt(search_query, search_results)
+                if best_match and confidence in ("high", "medium"):
+                    print(f"  Assistant: Found: {best_match['name']}")
+                    pending_searched_foods.append(best_match)
+                else:
+                    fallback = pick_reasonable_search_result(search_query, search_results)
+                    if fallback:
+                        print(f"  Assistant: Found likely match: {fallback['name']}")
+                        pending_searched_foods.append(fallback)
+                    else:
+                        still_not_found.append(desc)
+            else:
+                still_not_found.append(desc)
+        not_found = still_not_found
+
+        # If there are disambiguations, start asking
+        process_next_disambiguation()
+
+    # ── Main loop ──
+    try:
+        while True:
+            try:
+                user_input = input(f"  {USER_NAME}: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n\nBye!")
+                break
+
+            if not user_input:
+                continue
+            if user_input.lower() in ("quit", "exit", "bye", "q"):
+                print("\n  Assistant: Later! Keep hitting those goals.\n")
+                break
+
+            # ── Picking from disambiguation options ──
+            if awaiting_pick:
+                try:
+                    choice = int(user_input.strip()) - 1
+                    if 0 <= choice < len(pick_options):
+                        chosen = pick_options[choice]
+                        pending_foods.append(chosen)
+                        awaiting_pick = False
+                        print(f"\n  Assistant: Got it — {chosen['name']}.")
+                        process_next_disambiguation()
+                        continue
+                    else:
+                        print(f"\n  Assistant: Pick a number between 1 and {len(pick_options)}.\n")
+                        continue
+                except ValueError:
+                    awaiting_pick = False
+                    pick_options = []
+                    # Fall through to re-parse
+
+            # ── Confirmation flow ──
+            if awaiting_confirmation:
+                # Build pending food info for context
+                pending_info_parts = []
+                pending_names = []
+                for f in pending_foods:
+                    info = f"- {f['name']}"
+                    pending_names.append(f['name'])
+                    if f.get("calories"):
+                        info += f" (Calories: {f['calories']}"
+                        if f.get("protein"):
+                            info += f", Protein: {f['protein']}g"
+                        info += ")"
+                    pending_info_parts.append(info)
+                for f in pending_searched_foods:
+                    info = f"- {f['name']}"
+                    pending_names.append(f['name'])
+                    if f.get("cal_info"):
+                        info += f" ({f['cal_info']})"
+                    pending_info_parts.append(info)
+
+                pending_info = "\n".join(pending_info_parts) if pending_info_parts else "No nutrition info available."
+                meal_name = MEALS[pending_meal_idx]["name"]
+
+                # Single GPT call to understand what the user wants
+                confirm_resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    temperature=0,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are a food logging assistant. The user was asked to confirm logging food.\n"
+                                f"Pending food(s) to log to {meal_name}:\n{pending_info}\n\n"
+                                "Classify the user's response into ONE of these actions:\n\n"
+                                '1. "confirm" — they said yes/ok/sure/yeah/go ahead/log it/do it (confirming the pending food)\n'
+                                '2. "reject" — they said no/nah/cancel/wrong/nevermind (rejecting the pending food). '
+                                "They may also mention a REPLACEMENT food to search for instead "
+                                '(e.g. "no, banza pasta" or "wrong, I meant chicken breast")\n'
+                                '3. "adjust_qty" — they want the SAME food but a different number of servings. '
+                                'Examples: "log 2 servings" → quantity=2, "I had 3 of these" → quantity=3, '
+                                '"can we log 2 servings of this?" → quantity=2, "I had 4 oz not 2 oz" → quantity=2, '
+                                '"I had double" → quantity=2, "half a serving" → quantity=0.5. '
+                                "Use this when the food is correct but they just need more/less.\n"
+                                '4. "correction" — they want a COMPLETELY DIFFERENT ENTRY (different brand, different food name). '
+                                'They mention a specific brand or food name that differs from the pending food '
+                                '(e.g. "it should be under BANZA", "search for Kirkland chicken instead"). '
+                                "Use this only when they want a different product, not just more servings.\n"
+                                '5. "add_more" — they confirm the current food AND want to add more foods '
+                                '(e.g. "yes, and also rice", "yeah along with asparagus")\n'
+                                '6. "question" — they are asking about the pending food '
+                                '(e.g. "what are the macros?", "how much protein?")\n\n'
+                                "Return ONLY a JSON object:\n"
+                                "{\n"
+                                '  "action": "confirm"|"reject"|"adjust_qty"|"correction"|"add_more"|"question",\n'
+                                '  "replacement_food": "food to search for instead (for reject), or null",\n'
+                                '  "quantity": number of servings as a decimal (for adjust_qty, e.g. 2 or 1.5) or null,\n'
+                                '  "search_term": "brand/food name to search MFP for (for correction), or null",\n'
+                                '  "target_calories": approximate calorie target (for correction) or null,\n'
+                                '  "target_protein": approximate protein grams target (for correction) or null,\n'
+                                '  "extra_foods": "additional foods to log (for add_more), or null"\n'
+                                "}\n\n"
+                                "IMPORTANT:\n"
+                                '- "ok" or "sure" at the START of a longer message about calories/macros is NOT a confirmation — '
+                                "it's an adjust_qty or correction\n"
+                                "- If they say 'log X servings' or 'I had X servings' or 'X of these', "
+                                "that is adjust_qty with quantity=X. The quantity is the NUMBER they say, not divided by anything.\n"
+                                "- If they specify a physical amount (e.g. '4 oz') and the entry has a different amount (e.g. '2 oz'), "
+                                "divide to get quantity (4/2=2)\n"
+                                "- 'double' = quantity 2, 'triple' = quantity 3, 'half' = quantity 0.5\n"
+                                "- If they mention a DIFFERENT brand or food name, use correction\n"
+                                "- If they say no + mention a food, put that food in replacement_food"
+                            ),
+                        },
+                        {"role": "user", "content": user_input},
+                    ],
+                )
+                confirm_raw = confirm_resp.choices[0].message.content.strip()
+                try:
+                    decision = json.loads(confirm_raw)
+                except json.JSONDecodeError:
+                    decision = {"action": "question"}
+
+                action = decision.get("action", "question")
+
+                # ── CONFIRM ──
+                if action == "confirm":
+                    _, _, logged_names, failed_names, any_success = commit_pending_logs()
+                    if any_success:
+                        food_names = ", ".join(logged_names)
+                        print(f"\n  Assistant: Done! Logged to {meal_name}: {food_names}.")
+                        if failed_names:
+                            print(f"  Assistant: Couldn't auto-log: {', '.join(failed_names)}")
+                    elif failed_names:
+                        print(f"\n  Assistant: I couldn't auto-log: {', '.join(failed_names)}")
+                    else:
+                        print(f"\n  Assistant: Something went wrong. Check MFP.")
+                    reset_state()
+                    # Keep last_meal_idx so follow-ups like "also log X" stay on the same meal
+                    print(f"  Assistant: Want to log anything else?\n")
+                    continue
+
+                # ── REJECT (optionally with replacement food) ──
+                elif action == "reject":
+                    replacement = decision.get("replacement_food")
+                    saved_meal_idx = pending_meal_idx
+                    rejected = [f["name"] for f in pending_foods]
+                    rejected += [f["name"] for f in pending_searched_foods]
+                    reset_state()
+                    if replacement:
+                        print(f"\n  Assistant: Got it, canceling that. Let me look up {replacement}...")
+                        start_food_matching(replacement, saved_meal_idx, rejected_names=rejected)
+                    else:
+                        print(f"\n  Assistant: No worries. Tell me what you had and I'll try again.\n")
+                    continue
+
+                # ── ADJUST QUANTITY (same food, different number of servings) ──
+                elif action == "adjust_qty":
+                    qty = decision.get("quantity")
+                    if qty and qty > 0:
+                        pending_quantity = str(qty)
+                        # Show the user what the adjusted entry looks like
+                        food_name = pending_names[0] if pending_names else "food"
+                        # Try to compute adjusted macros from the pending food info
+                        base_food = (pending_searched_foods[0] if pending_searched_foods
+                                     else pending_foods[0] if pending_foods else None)
+                        cal_info = ""
+                        if base_food:
+                            ci = base_food.get("cal_info", "")
+                            if ci:
+                                cal_info = f" (base: {ci})"
+                        qty_display = int(qty) if qty == int(qty) else qty
+                        print(f"\n  Assistant: Got it — logging {qty_display} serving(s) of {food_name}{cal_info}.")
+                        print(f"  Assistant: Go ahead? (yes/no)\n")
+                    else:
+                        print(f"\n  Assistant: I couldn't figure out the quantity. How many servings did you have?\n")
+                    continue
+
+                # ── ADD MORE (confirm current + search for additional foods) ──
+                elif action == "add_more":
+                    extra_food = decision.get("extra_foods")
+                    if extra_food:
+                        _, _, logged_names, failed_names, any_success = commit_pending_logs()
+                        if any_success:
+                            food_names = ", ".join(logged_names)
+                            print(f"\n  Assistant: Logged: {food_names}")
+                            if failed_names:
+                                print(f"  Assistant: Couldn't auto-log: {', '.join(failed_names)}")
+                        elif failed_names:
+                            print(f"\n  Assistant: I couldn't auto-log: {', '.join(failed_names)}")
+                        saved_meal_idx = pending_meal_idx
+                        reset_state()
+                        start_food_matching(extra_food, saved_meal_idx)
+                    continue
+
+                # ── CORRECTION (search for a better-matching entry) ──
+                elif action == "correction":
+                    target_cals = decision.get("target_calories")
+                    target_protein = decision.get("target_protein")
+                    search_term = decision.get("search_term")
+                    search_name = search_term if search_term else (pending_names[0] if pending_names else "food")
+                    search_query = normalize_food_query(search_name)
+
+                    target_parts = []
+                    if target_cals:
+                        target_parts.append(f"~{target_cals} cal")
+                    if target_protein:
+                        target_parts.append(f"~{target_protein}g protein")
+                    target_display = ", ".join(target_parts) if target_parts else "a better match"
+                    print(f"\n  Assistant: Looking for {target_display} entry for \"{search_query}\"...")
+
+                    search_results, search_meta = search_foods(session, search_query, pending_meal_idx)
+
+                    if search_results:
+                        target_desc = search_query
+                        if target_cals:
+                            target_desc += f" (around {target_cals} calories"
+                            if target_protein:
+                                target_desc += f", ~{target_protein}g protein"
+                            target_desc += ")"
+
+                        food_names_list = [
+                            f"{i}: {f['name']}" + (f" ({f['cal_info']})" if f.get("cal_info") else "")
+                            for i, f in enumerate(search_results)
+                        ]
+                        food_list_str = "\n".join(food_names_list)
+
+                        pick_resp = client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            temperature=0,
+                            messages=[
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        "The user wants to log a food but needs a different entry/serving size.\n"
+                                        "Pick the search result whose calories/macros are CLOSEST to the user's target.\n"
+                                        "Also prefer entries whose NAME matches the search term.\n\n"
+                                        'Return ONLY: {"match": index_number, "confidence": "high"|"medium"|"low"}\n'
+                                        'If nothing is close: {"match": null, "confidence": "none"}\n'
+                                    ),
+                                },
+                                {
+                                    "role": "user",
+                                    "content": f"Target: {target_desc}\n\nSearch results:\n{food_list_str}",
+                                },
+                            ],
+                        )
+                        pick_raw = pick_resp.choices[0].message.content.strip()
+                        try:
+                            pick_result = json.loads(pick_raw)
+                        except json.JSONDecodeError:
+                            pick_result = {"match": None}
+
+                        idx = pick_result.get("match")
+                        if idx is not None and isinstance(idx, int) and 0 <= idx < len(search_results):
+                            new_food = search_results[idx]
+                            if search_meta and not pending_search_metadata:
+                                pending_search_metadata = search_meta
+                            pending_foods.clear()
+                            pending_searched_foods.clear()
+                            pending_searched_foods.append(new_food)
+                            cal_display = f" ({new_food['cal_info']})" if new_food.get('cal_info') else ""
+                            print(f"  Assistant: Found: {new_food['name']}{cal_display}")
+                            print(f"  Assistant: Go ahead? (yes/no)\n")
+                        else:
+                            print(f"  Assistant: Couldn't find an entry close to {target_display}.")
+                            print(f"  Assistant: You can say yes to log the current one, or no to cancel.\n")
+                    else:
+                        print(f"  Assistant: No results found for \"{search_query}\".")
+                        print(f"  Assistant: You can say yes to log the current one, or no to cancel.\n")
+                    continue
+
+                # ── QUESTION (answer about the pending food) ──
+                else:
+                    food_question_prompt = (
+                        f"The user is about to log these foods to {meal_name} and has a question.\n"
+                        f"Pending foods:\n{pending_info}\n\n"
+                        f"User question: {user_input}\n\n"
+                        f"Answer their question about the pending food(s) based on the info above. "
+                        f"Be concise. After answering, remind them they can say yes to log or no to cancel."
+                    )
+                    resp = client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        temperature=0,
+                        messages=[
+                            {"role": "system", "content": food_question_prompt},
+                            {"role": "user", "content": user_input},
+                        ],
+                    )
+                    answer = resp.choices[0].message.content.strip()
+                    print(f"\n  Assistant: {answer}\n")
+                    continue
+
+            # ── Parse what the user said ──
+            parsed = parse_user_message(user_input)
+            intent = parsed.get("intent", "chat")
+            mentioned_meal = parsed.get("meal")
+            food_desc = parsed.get("foods")
+
+            # ── Skip intent ──
+            if intent == "skip":
+                if mentioned_meal and mentioned_meal in MEAL_NAMES_TO_IDX:
+                    print(f"\n  Assistant: Got it, skipping {mentioned_meal.title()}.\n")
+                else:
+                    print(f"\n  Assistant: No problem. Let me know when you're ready.\n")
+                continue
+
+            # ── Defer intent (snooze reminder for 1 hour) ──
+            if intent == "defer":
+                wake_time = datetime.now() + timedelta(hours=1)
+
+                if mentioned_meal and mentioned_meal in MEAL_NAMES_TO_IDX:
+                    meal_idx = MEAL_NAMES_TO_IDX[mentioned_meal]
+                    snooze_state[meal_idx] = wake_time
+                    print(f"\n  Assistant: No worries! I'll check back about {mentioned_meal.lower()} in an hour.\n")
+                else:
+                    # Snooze all currently unlogged meals
+                    try:
+                        unlogged = get_unlogged_meals(session)
+                    except Exception:
+                        unlogged = []
+                    if unlogged:
+                        for idx, name in unlogged:
+                            snooze_state[idx] = wake_time
+                        names = ", ".join(n.lower() for _, n in unlogged)
+                        print(f"\n  Assistant: No worries! I'll check back about {names} in an hour.\n")
+                    else:
+                        print(f"\n  Assistant: All your meals are already logged! Nothing to defer.\n")
+                continue
+
+            # ── Remove intent ──
+            if intent == "remove":
+                # "clear my dinner" / "remove everything" without specific food = clear all
+                if not food_desc:
+                    food_desc = "everything"
+                diary, _ = get_diary_details(session, date.today())
+
+                # Collect all logged foods across meals (or specific meal)
+                candidates = []
+                if mentioned_meal and mentioned_meal in MEAL_NAMES_TO_IDX:
+                    target_idx = MEAL_NAMES_TO_IDX[mentioned_meal]
+                    for f in diary.get(target_idx, []):
+                        f["meal_idx"] = target_idx
+                        candidates.append(f)
+                else:
+                    for midx, foods in diary.items():
+                        for f in foods:
+                            f["meal_idx"] = midx
+                            candidates.append(f)
+
+                if not candidates:
+                    print(f"\n  Assistant: Nothing logged to remove.\n")
+                    continue
+
+                # "everything" = remove all from that meal
+                if food_desc.lower() in ("everything", "all", "all of it"):
+                    meal_name = MEALS[candidates[0]["meal_idx"]]["name"] if mentioned_meal else "all meals"
+                    food_names = ", ".join(f["name"] for f in candidates)
+                    print(f"\n  Assistant: Remove from {meal_name}: {food_names}? (yes/no)\n")
+                    # Store for confirmation
+                    pending_meal_idx = candidates[0]["meal_idx"] if mentioned_meal else None
+                    pending_foods = candidates
+                    awaiting_confirmation = False
+
+                    # Inline yes/no for remove
+                    try:
+                        confirm = input(f"  {USER_NAME}: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    confirm_words = set(confirm.split())
+                    if confirm_words & {"yes", "y", "yeah", "yep", "yup", "sure", "ok", "do", "please"}:
+                        removed = 0
+                        for f in candidates:
+                            if f.get("entry_id") and remove_food(session, f["entry_id"]):
+                                removed += 1
+                        print(f"\n  Assistant: Done! Removed {removed} item(s).\n")
+                    else:
+                        print(f"\n  Assistant: No worries, kept everything.\n")
+                    continue
+
+                # Use GPT to match which logged food(s) to remove
+                food_names_list = [f"{i}: {f['name']}" for i, f in enumerate(candidates)]
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    temperature=0,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "The user wants to REMOVE food from their diary. "
+                                "Match what they said to the numbered list of logged foods. "
+                                "Return ONLY a JSON array of matching index numbers, e.g. [0, 2]. "
+                                "Match loosely. Return [] if no match."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Remove: {food_desc}\n\nLogged foods:\n" + "\n".join(food_names_list),
+                        },
+                    ],
+                )
+                raw = response.choices[0].message.content.strip()
+                try:
+                    indices = json.loads(raw)
+                    to_remove = [candidates[i] for i in indices if isinstance(i, int) and 0 <= i < len(candidates)]
+                except (json.JSONDecodeError, IndexError):
+                    to_remove = []
+
+                if not to_remove:
+                    print(f"\n  Assistant: Couldn't find \"{food_desc}\" in your logged foods.\n")
+                    continue
+
+                food_names = ", ".join(f["name"] for f in to_remove)
+                print(f"\n  Assistant: Remove: {food_names}? (yes/no)\n")
+
+                try:
+                    confirm = input(f"  {USER_NAME}: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                confirm_words = set(confirm.split())
+                if confirm_words & {"yes", "y", "yeah", "yep", "yup", "sure", "ok", "do", "please"}:
+                    removed = 0
+                    for f in to_remove:
+                        if f.get("entry_id") and remove_food(session, f["entry_id"]):
+                            removed += 1
+                    print(f"\n  Assistant: Done! Removed {removed} item(s).\n")
+                else:
+                    print(f"\n  Assistant: Kept everything as is.\n")
+                continue
+
+            # ── Create meal preset ──
+            if intent == "create_meal":
+                preset_name = parsed.get("preset_name")
+                if not preset_name:
+                    print(f"\n  Assistant: What do you want to call this meal preset?\n")
+                    try:
+                        preset_name = input(f"  {USER_NAME}: ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    if not preset_name:
+                        print(f"\n  Assistant: Never mind.\n")
+                        continue
+
+                # Check if foods were provided in the same message
+                food_list_str = food_desc
+                if not food_list_str:
+                    print(f"\n  Assistant: What foods go in \"{preset_name}\"?\n")
+                    try:
+                        food_list_str = input(f"  {USER_NAME}: ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    if not food_list_str:
+                        print(f"\n  Assistant: Never mind.\n")
+                        continue
+
+                food_items = split_food_descriptions(food_list_str)
+                presets = load_presets()
+                presets[preset_name.lower()] = {
+                    "foods": [{"search_name": f, "servings": 1} for f in food_items]
+                }
+                save_presets(presets)
+
+                foods_display = "\n".join(f"    - {f} (1 serving)" for f in food_items)
+                print(f"\n  Assistant: Saved \"{preset_name}\" with {len(food_items)} food(s):")
+                print(foods_display)
+                print()
+                continue
+
+            # ── Log a saved meal preset ──
+            if intent == "log_meal":
+                preset_name = parsed.get("preset_name", "")
+                matched_name, preset = get_preset(preset_name) if preset_name else (None, None)
+
+                if not matched_name:
+                    names = get_preset_names()
+                    if names:
+                        print(f"\n  Assistant: I don't have a preset called \"{preset_name}\".")
+                        print(f"  Assistant: Your saved presets: {', '.join(names)}\n")
+                    else:
+                        print(f"\n  Assistant: You don't have any saved meal presets yet.")
+                        print(f"  Assistant: Create one with: \"create a meal called [name]\"\n")
+                    continue
+
+                # Determine which MFP meal to log to
+                unlogged = get_unlogged_meals(session)
+                if mentioned_meal:
+                    meal_idx = resolve_meal_idx(mentioned_meal, unlogged)
+                elif last_meal_idx is not None:
+                    meal_idx = last_meal_idx
+                else:
+                    meal_idx = resolve_meal_idx(None, unlogged)
+
+                meal_name = MEALS[meal_idx]["name"]
+                foods = preset["foods"]
+                print(f"\n  Assistant: Logging \"{matched_name}\" to {meal_name} ({len(foods)} foods)...")
+
+                # Get search metadata once for all foods
+                search_meta = None
+                logged = []
+                failed = []
+
+                for item in foods:
+                    name = item["search_name"]
+                    servings = str(item.get("servings", 1))
+
+                    # First try recent foods
+                    all_foods, metadata = get_recent_foods(session, meal_idx)
+                    if all_foods:
+                        match_results = match_foods_with_gpt(name, all_foods)
+                        if match_results and match_results[0].get("matches"):
+                            matched_food = all_foods[match_results[0]["matches"][0]]
+                            if servings != "1":
+                                matched_food["quantity"] = servings
+                            if log_foods(session, [matched_food], all_foods, meal_idx, metadata):
+                                qty_note = f" (x{servings})" if servings != "1" else ""
+                                logged.append(f"{matched_food['name']}{qty_note}")
+                                continue
+
+                    # Fall back to search
+                    search_query = normalize_food_query(name)
+                    search_results, s_meta = search_foods(session, search_query, meal_idx)
+                    if not search_meta and s_meta:
+                        search_meta = s_meta
+
+                    if search_results:
+                        best_match, confidence = match_search_results_with_gpt(search_query, search_results)
+                        if best_match and confidence in ("high", "medium"):
+                            meta = search_meta or s_meta
+                            if meta and log_searched_food(session, best_match, meal_idx, meta, quantity=servings):
+                                qty_note = f" (x{servings})" if servings != "1" else ""
+                                logged.append(f"{best_match['name']}{qty_note}")
+                                continue
+
+                    failed.append(name)
+
+                # Report results
+                for name in logged:
+                    print(f"    Logged: {name}")
+                for name in failed:
+                    print(f"    Failed: {name}")
+
+                if logged:
+                    print(f"  Assistant: Done! Logged {len(logged)}/{len(foods)} foods to {meal_name}.")
+                else:
+                    print(f"  Assistant: Couldn't log any foods from \"{matched_name}\".")
+                if failed:
+                    print(f"  Assistant: Couldn't find: {', '.join(failed)}")
+                last_meal_idx = meal_idx
+                print()
+                continue
+
+            # ── Manage meal presets (list, delete, add/remove food) ──
+            if intent == "manage_meal":
+                sub = parsed.get("sub_action", "list")
+                preset_name = parsed.get("preset_name", "")
+
+                if sub == "list":
+                    presets = load_presets()
+                    if not presets:
+                        print(f"\n  Assistant: No saved meal presets yet.")
+                        print(f"  Assistant: Create one with: \"create a meal called [name]\"\n")
+                    else:
+                        print(f"\n  Assistant: Your saved meal presets:")
+                        for name, data in presets.items():
+                            foods = data.get("foods", [])
+                            food_names = ", ".join(
+                                f"{f['search_name']}" + (f" (x{f['servings']})" if f.get("servings", 1) != 1 else "")
+                                for f in foods
+                            )
+                            print(f"    - {name}: {food_names}")
+                        print()
+                    continue
+
+                elif sub == "delete":
+                    matched_name, _ = get_preset(preset_name) if preset_name else (None, None)
+                    if matched_name:
+                        presets = load_presets()
+                        del presets[matched_name]
+                        save_presets(presets)
+                        print(f"\n  Assistant: Deleted \"{matched_name}\".\n")
+                    else:
+                        print(f"\n  Assistant: No preset found matching \"{preset_name}\".\n")
+                    continue
+
+                elif sub == "add_food" and food_desc:
+                    matched_name, preset = get_preset(preset_name) if preset_name else (None, None)
+                    if matched_name and preset:
+                        new_foods = split_food_descriptions(food_desc)
+                        presets = load_presets()
+                        for f in new_foods:
+                            presets[matched_name]["foods"].append({"search_name": f, "servings": 1})
+                        save_presets(presets)
+                        print(f"\n  Assistant: Added {', '.join(new_foods)} to \"{matched_name}\".\n")
+                    else:
+                        print(f"\n  Assistant: No preset found matching \"{preset_name}\".\n")
+                    continue
+
+                elif sub == "remove_food" and food_desc:
+                    matched_name, preset = get_preset(preset_name) if preset_name else (None, None)
+                    if matched_name and preset:
+                        presets = load_presets()
+                        lower_desc = food_desc.lower()
+                        original_count = len(presets[matched_name]["foods"])
+                        presets[matched_name]["foods"] = [
+                            f for f in presets[matched_name]["foods"]
+                            if lower_desc not in f["search_name"].lower()
+                        ]
+                        removed_count = original_count - len(presets[matched_name]["foods"])
+                        if removed_count > 0:
+                            save_presets(presets)
+                            print(f"\n  Assistant: Removed {removed_count} item(s) matching \"{food_desc}\" from \"{matched_name}\".\n")
+                        else:
+                            print(f"\n  Assistant: No food matching \"{food_desc}\" found in \"{matched_name}\".\n")
+                    else:
+                        print(f"\n  Assistant: No preset found matching \"{preset_name}\".\n")
+                    continue
+
+                continue
+
+            # ── Quick add (custom macros) ──
+            if intent == "quick_add":
+                calories = parsed.get("calories", 0) or 0
+                protein = parsed.get("protein", 0) or 0
+                fat = parsed.get("fat", 0) or 0
+                carbs = parsed.get("carbs", 0) or 0
+                description = food_desc or "Quick Add"
+
+                unlogged = get_unlogged_meals(session)
+                if mentioned_meal:
+                    meal_idx = resolve_meal_idx(mentioned_meal, unlogged)
+                elif last_meal_idx is not None:
+                    meal_idx = last_meal_idx
+                else:
+                    meal_idx = resolve_meal_idx(None, unlogged)
+
+                meal_name = MEALS[meal_idx]["name"]
+                print(f"\n  Assistant: Quick adding \"{description}\" to {meal_name}:")
+                print(f"    Calories: {calories} | Protein: {protein}g | Fat: {fat}g | Carbs: {carbs}g")
+
+                if quick_add_food(session, meal_idx, description, calories, protein, carbs, fat):
+                    print(f"  Assistant: Done! Logged to {meal_name}.\n")
+                    last_meal_idx = meal_idx
+                else:
+                    print(f"  Assistant: Something went wrong with the quick add. Try again.\n")
+                continue
+
+            # ── Log intent ──
+            if intent == "log" and food_desc:
+                unlogged = get_unlogged_meals(session)
+                if mentioned_meal:
+                    meal_idx = resolve_meal_idx(mentioned_meal, unlogged)
+                elif last_meal_idx is not None:
+                    # User just canceled and is retrying — keep the same meal
+                    meal_idx = last_meal_idx
+                else:
+                    meal_idx = resolve_meal_idx(None, unlogged)
+                start_food_matching(food_desc, meal_idx)
+                continue
+
+            # ── Chat — answer questions with diary context ──
+            if intent == "chat":
+                lower = user_input.lower()
+                if any(w in lower for w in ["help", "how do i", "how does"]):
+                    print(f"\n  Assistant: Just tell me what you ate! Like \"I had chicken and rice for dinner\".")
+                    print(f"  Assistant: I'll match it to your MFP foods and log it.\n")
+                    continue
+
+                context = build_diary_context(session)
+                reply = smart_reply(user_input, context)
+                print(f"\n  Assistant: {reply}\n")
+                continue
+    finally:
+        reminder_stop.set()
+        summary_stop.set()
+        time.sleep(0.05)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Diet Assistant for MyFitnessPal")
+    parser.add_argument("--voice", action="store_true", help="Speak Assistant messages through local speakers")
+    parser.add_argument("--voice-name", type=str, default=None, help="Optional TTS voice name (e.g. 'Samantha')")
+    parser.add_argument(
+        "--reminder-times",
+        type=str,
+        default=os.getenv("REMINDER_TIMES", "09:30,13:30,19:30"),
+        help="Comma-separated HH:MM reminders when meals are unlogged",
+    )
+    parser.add_argument("--no-reminders", action="store_true", help="Disable timed reminders")
+    parser.add_argument(
+        "--summary-time",
+        type=str,
+        default=os.getenv("SUMMARY_TIME", "23:49"),
+        help="HH:MM time to text daily diet summary (default 23:49)",
+    )
+    parser.add_argument("--no-summary", action="store_true", help="Disable nightly summary text")
+    parser.add_argument("--test-sms", action="store_true", help="Send a test SMS and exit (to verify Twilio config)")
+    args = parser.parse_args()
+
+    if args.test_sms:
+        print("Building daily summary from MFP...")
+        session = create_session()
+        msg = build_daily_summary(session)
+        if not msg:
+            print("No diary data to summarize today.")
+            sys.exit(1)
+        print(f"Sending summary:\n{msg}\n")
+        ok = send_sms(msg)
+        if ok:
+            print("Summary sent successfully! Check your phone.")
+        else:
+            print("Failed to send summary.")
+        sys.exit(0)
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("Missing OPENAI_API_KEY in .env!")
+        print("Add it like: OPENAI_API_KEY=sk-...")
+        sys.exit(1)
+
+    speaker = Speaker(enabled=args.voice, voice_name=args.voice_name)
+    original_stdout = sys.stdout
+    if speaker.enabled:
+        sys.stdout = AssistantSpeechInterceptor(sys.stdout, speaker)
+        print("Voice mode enabled. Assistant replies will be spoken on your current audio output.")
+
+    reminder_times = [] if args.no_reminders else parse_reminder_times(args.reminder_times)
+    if reminder_times:
+        print(f"Reminder times active: {', '.join(reminder_times)}")
+
+    summary_time = None if args.no_summary else args.summary_time
+    if summary_time:
+        print(f"Nightly summary text at: {summary_time}")
+
+    try:
+        run_terminal_chat(reminder_times=reminder_times, summary_time=summary_time)
+    finally:
+        if speaker.enabled:
+            sys.stdout = original_stdout
+
+
+if __name__ == "__main__":
+    main()

@@ -55,6 +55,28 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 MEAL_NAMES_TO_IDX = {info["name"].lower(): idx for idx, info in MEALS.items()}
 
+# ── Recent foods cache (avoid re-fetching from MFP on every log) ──────────
+
+_recents_cache = {}  # {meal_idx: {"foods": [...], "metadata": ..., "ts": float}}
+RECENTS_TTL = 120    # seconds — cache recents for 2 minutes
+
+def get_recent_foods_cached(session, meal_idx):
+    """Wrapper around get_recent_foods with a 2-minute in-memory cache."""
+    now = time.time()
+    entry = _recents_cache.get(meal_idx)
+    if entry and (now - entry["ts"]) < RECENTS_TTL:
+        return entry["foods"], entry["metadata"]
+    foods, metadata = get_recent_foods(session, meal_idx)
+    _recents_cache[meal_idx] = {"foods": foods, "metadata": metadata, "ts": now}
+    return foods, metadata
+
+def invalidate_recents_cache(meal_idx=None):
+    """Clear cache after logging/removing so next fetch is fresh."""
+    if meal_idx is not None:
+        _recents_cache.pop(meal_idx, None)
+    else:
+        _recents_cache.clear()
+
 
 # ── Voice + reminders ──────────────────────────────────────────────────────
 
@@ -94,31 +116,53 @@ class Speaker:
             print("Voice mode enabled, but no TTS backend found (`say`/`espeak`).")
             self.enabled = False
 
+    @staticmethod
+    def _set_volume(level=100):
+        """Set macOS system volume (0-100)."""
+        try:
+            subprocess.run(["osascript", "-e", f"set volume output volume {level}"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def _build_cmd(self, text):
+        cmd = [self.backend]
+        if self.voice_name:
+            cmd += ["-v", self.voice_name]
+        cmd.append(text)
+        return cmd
+
     def speak(self, text):
+        """Non-blocking TTS — fire and forget."""
         if not self.enabled or not text:
             return
         try:
-            if self.backend == "say":
-                cmd = ["say"]
-                if self.voice_name:
-                    cmd += ["-v", self.voice_name]
-                cmd.append(text)
-                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            elif self.backend == "espeak":
-                cmd = ["espeak"]
-                if self.voice_name:
-                    cmd += ["-v", self.voice_name]
-                cmd.append(text)
-                subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._set_volume(100)
+            subprocess.Popen(self._build_cmd(text),
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def speak_and_wait(self, text, volume=100):
+        """Blocking TTS — waits until speech finishes. Required for voice-input
+        mode so the mic doesn't open while TTS is still playing."""
+        if not self.enabled or not text:
+            return
+        try:
+            self._set_volume(volume)
+            subprocess.run(self._build_cmd(text),
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(0.3)  # Let audio output buffer drain
         except Exception:
             pass
 
 
 class AssistantSpeechInterceptor:
     """Intercept stdout and speak lines that contain `Assistant:`."""
-    def __init__(self, wrapped, speaker):
+    def __init__(self, wrapped, speaker, blocking=False):
         self.wrapped = wrapped
         self.speaker = speaker
+        self.blocking = blocking  # True when voice input is active
         self._buffer = ""
 
     def write(self, data):
@@ -129,18 +173,26 @@ class AssistantSpeechInterceptor:
             line, self._buffer = self._buffer.split("\n", 1)
             if "Assistant:" in line:
                 spoken = line.split("Assistant:", 1)[1].strip()
-                self.speaker.speak(spoken)
+                if self.blocking:
+                    self.speaker.speak_and_wait(spoken)
+                else:
+                    self.speaker.speak(spoken)
 
     def flush(self):
         self.wrapped.flush()
 
 
-def start_reminder_loop(session, reminder_times, stop_event, snooze_state):
+def start_reminder_loop(session, reminder_times, stop_event, snooze_state,
+                        io_lock=None, input_provider=None, speaker=None):
     """Background reminders — only fires for the specific meal at each time.
 
     reminder_times: list of "HH:MM" strings (e.g. ["09:30", "13:30", "19:30"])
     snooze_state: dict shared with main thread. Keys are meal_idx (int),
                   values are datetime of when to re-check after a user deferral.
+    io_lock: optional threading.Lock shared with VoiceInputProvider to prevent
+             reminders from speaking while the mic is recording.
+    input_provider: optional AlwaysOnInputProvider — used to open response windows.
+    speaker: optional Speaker — used to speak reminders at lower volume.
 
     Mapping: reminder_times[0] → Breakfast(0), [1] → Lunch(1), [2] → Dinner(2).
     Extra times beyond 3 remind for any unlogged meal (legacy behavior).
@@ -165,6 +217,52 @@ def start_reminder_loop(session, reminder_times, stop_event, snooze_state):
         except Exception:
             return False
 
+    def _get_remaining():
+        """Get remaining calories and protein for today."""
+        try:
+            _, summary = get_diary_details(session, date.today())
+            remaining = summary.get("remaining", {})
+            cal = remaining.get("calories", "?")
+            protein = remaining.get("protein", "?")
+            return cal, protein
+        except Exception:
+            return "?", "?"
+
+    def _say(msg):
+        """Print a reminder message and optionally speak it.
+
+        In always-on mode: speak at volume 10, then open a 15-second
+        response window so the user can reply without saying 'Hey Claude'.
+        """
+        from voice_io import AlwaysOnInputProvider
+        is_always_on = isinstance(input_provider, AlwaysOnInputProvider)
+
+        if is_always_on and speaker:
+            # Speak directly at low volume instead of going through interceptor
+            if io_lock:
+                io_lock.acquire()
+            try:
+                # Extract spoken text from the "Assistant: ..." format
+                spoken = msg.strip()
+                if "Assistant:" in spoken:
+                    spoken = spoken.split("Assistant:", 1)[1].strip()
+                speaker.speak_and_wait(spoken, volume=10)
+                # Print (but interceptor will also try to speak — we need to
+                # temporarily suppress it). Just print to wrapped stdout.
+                original = getattr(sys.stdout, 'wrapped', sys.stdout)
+                original.write(msg + "\n" if not msg.endswith("\n") else msg)
+                original.flush()
+            finally:
+                if io_lock:
+                    io_lock.release()
+            # Open response window — user has 15 seconds to reply
+            input_provider.open_reminder_response_window(15)
+        elif io_lock:
+            with io_lock:
+                print(msg)
+        else:
+            print(msg)
+
     def _loop():
         while not stop_event.is_set():
             now = datetime.now()
@@ -183,7 +281,8 @@ def start_reminder_loop(session, reminder_times, stop_event, snooze_state):
                 meal_name = MEALS[meal_idx]["name"]
                 if not _check_meal_logged(meal_idx):
                     fired_today.add(slot_key)
-                    print(f"\n  Assistant: Hey, you haven't logged {meal_name.lower()} yet. What did you have?\n")
+                    cal, protein = _get_remaining()
+                    _say(f"\n  Assistant: Hey, wanna log {meal_name.lower()}? You still need {cal} cal and {protein}g protein today.\n")
 
             # ── Check snoozed meals ──
             for meal_idx in list(snooze_state.keys()):
@@ -192,7 +291,8 @@ def start_reminder_loop(session, reminder_times, stop_event, snooze_state):
                     del snooze_state[meal_idx]
                     meal_name = MEALS[meal_idx]["name"]
                     if not _check_meal_logged(meal_idx):
-                        print(f"\n  Assistant: Checking back — did you end up having {meal_name.lower()}?\n")
+                        cal, protein = _get_remaining()
+                        _say(f"\n  Assistant: Checking back — did you have {meal_name.lower()}? Still need {cal} cal and {protein}g protein.\n")
                     # else: meal was logged, no need to remind
 
             stop_event.wait(20)
@@ -486,6 +586,143 @@ def normalize_food_query(food_text):
     return q or food_text.strip()
 
 
+def split_compound_food_for_search(food_text):
+    """Break compound dish names into multiple searchable food items."""
+    raw = normalize_food_query(food_text)
+    if not raw:
+        return []
+
+    # Fast path: obvious separators.
+    quick_parts = re.split(r",| and | with |&|\/|\+", raw, flags=re.IGNORECASE)
+    quick_parts = [p.strip() for p in quick_parts if p and p.strip()]
+    if len(quick_parts) > 1:
+        return quick_parts
+
+    # Heuristics for common South Asian terms (can be extended).
+    term_map = {
+        "chawal": "rice",
+        "chawal": "rice",
+        "rice": "rice",
+        "channay": "channay",
+        "chanay": "channay",
+        "chana": "channay",
+        "chole": "channay",
+    }
+    tokens = re.findall(r"[a-zA-Z]+", raw.lower())
+    mapped = []
+    for t in tokens:
+        if t in term_map:
+            mapped.append(term_map[t])
+    if len(set(mapped)) >= 2:
+        return list(dict.fromkeys(mapped))
+
+    # GPT fallback for compound phrases without separators.
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Split a food phrase into individual food items for diary logging.\n"
+                        "Return ONLY a JSON array of short strings.\n"
+                        "Examples:\n"
+                        '- "channay chawal" -> ["channay", "rice"]\n'
+                        '- "rajma chawal" -> ["rajma", "rice"]\n'
+                        '- "protein bar" -> ["protein bar"]\n'
+                        "If it is one item, return one string in the array."
+                    ),
+                },
+                {"role": "user", "content": raw},
+            ],
+        )
+        parsed = json.loads(response.choices[0].message.content.strip())
+        if isinstance(parsed, list):
+            cleaned = [str(x).strip() for x in parsed if str(x).strip()]
+            if cleaned:
+                return cleaned
+    except Exception:
+        pass
+
+    return [raw]
+
+
+HOUSEHOLD_UNIT_TO_SERVINGS = {
+    "katori": 0.75,
+    "katoris": 0.75,
+    "bowl": 1.0,
+    "bowls": 1.0,
+    "plate": 1.5,
+    "plates": 1.5,
+}
+
+
+def parse_household_quantity_to_servings(text):
+    """Parse quantities like '1-2 katori' / '1 plate' into serving multiplier."""
+    t = (text or "").lower().strip()
+    if not t:
+        return None
+
+    # If no supported household unit is present, skip.
+    unit = None
+    for u in HOUSEHOLD_UNIT_TO_SERVINGS.keys():
+        if re.search(rf"\b{re.escape(u)}\b", t):
+            unit = u
+            break
+    if not unit:
+        return None
+
+    base = HOUSEHOLD_UNIT_TO_SERVINGS[unit]
+
+    # Common words
+    if re.search(r"\bhalf\b", t):
+        amount = 0.5
+    elif re.search(r"\bquarter\b", t):
+        amount = 0.25
+    elif re.search(r"\bdouble\b", t):
+        amount = 2.0
+    elif re.search(r"\btriple\b", t):
+        amount = 3.0
+    else:
+        # Number range: 1-2 / 1 to 2
+        m_range = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)", t)
+        if m_range:
+            lo = float(m_range.group(1))
+            hi = float(m_range.group(2))
+            amount = (lo + hi) / 2.0
+        else:
+            m_num = re.search(r"(\d+(?:\.\d+)?)", t)
+            amount = float(m_num.group(1)) if m_num else 1.0
+
+    servings = amount * base
+    if servings <= 0:
+        return None
+    return round(servings, 2), unit, amount, base
+
+
+def _tokenize_food_text(text):
+    tokens = re.findall(r"[a-z0-9]+", (text or "").lower())
+    stop = {
+        "a", "an", "the", "my", "to", "for", "with", "and", "or", "of",
+        "please", "log", "add", "meal", "breakfast", "lunch", "dinner", "snacks"
+    }
+    return {t for t in tokens if t not in stop}
+
+
+def has_reasonable_recent_overlap(description, candidate_names):
+    """Reject clearly unrelated recent-food matches before asking user to pick."""
+    desc_tokens = _tokenize_food_text(description)
+    if not desc_tokens:
+        return True
+
+    # Require at least one shared token with at least one candidate.
+    for name in candidate_names:
+        if desc_tokens & _tokenize_food_text(name):
+            return True
+    return False
+
+
 def pick_reasonable_search_result(search_query, search_results):
     """Heuristic fallback when GPT confidence is low on search matches."""
     q = search_query.lower().strip()
@@ -526,12 +763,11 @@ def smart_reply(user_input, diary_context):
             {
                 "role": "system",
                 "content": (
-                    f"You are a concise diet assistant for {USER_NAME}. "
-                    f"Answer their question based on the diary data below. "
-                    f"Be short and direct — 1-2 sentences max. "
-                    f"Don't dump the whole diary unless they specifically ask for a full summary. "
-                    f"If they ask about a specific food, just answer yes/no and which meal it's in. "
-                    f"If they ask about calories/protein remaining, give just the numbers.\n\n"
+                    f"You are a casual, chill diet assistant for {USER_NAME}. "
+                    f"Answer based on the diary data below. "
+                    f"Be super short and casual — 1 sentence max, like texting a friend. "
+                    f"No filler, no pleasantries. Just the answer. "
+                    f"When listing macros, always use this order: calories, protein, fat, carbs.\n\n"
                     f"{diary_context}"
                 ),
             },
@@ -539,6 +775,76 @@ def smart_reply(user_input, diary_context):
         ],
     )
     return response.choices[0].message.content.strip()
+
+
+def parse_per_food_quantities_with_gpt(user_input, pending_names):
+    """Extract per-food serving quantities from a confirmation message."""
+    if not pending_names:
+        return {}
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Extract per-food serving quantities from the user's sentence.\n"
+                        "You are given the pending food names. Return ONLY JSON object mapping food name to quantity.\n"
+                        "Use decimal numbers. Handle fractions like 1/2 -> 0.5.\n"
+                        "If no explicit per-food quantities are present, return {}.\n"
+                        "Only include foods from the pending list."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Pending foods: {', '.join(pending_names)}\n"
+                        f"User: {user_input}"
+                    ),
+                },
+            ],
+        )
+        raw = resp.choices[0].message.content.strip()
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            out = {}
+            for k, v in parsed.items():
+                try:
+                    qty = float(v)
+                except (ValueError, TypeError):
+                    continue
+                if qty > 0:
+                    out[str(k).strip()] = qty
+            return out
+    except Exception:
+        pass
+    return {}
+
+
+def parse_nutrition_from_cal_info(cal_info):
+    """Extract calories/protein/carbs/fat from text like '1 cup, 204 calories'."""
+    text = (cal_info or "").lower()
+
+    def grab(pattern):
+        m = re.search(pattern, text)
+        return float(m.group(1)) if m else None
+
+    return {
+        "calories": grab(r"(\d+(?:\.\d+)?)\s*cal"),
+        "protein": grab(r"(\d+(?:\.\d+)?)\s*g\s*protein"),
+        "carbs": grab(r"(\d+(?:\.\d+)?)\s*g\s*carb"),
+        "fat": grab(r"(\d+(?:\.\d+)?)\s*g\s*fat"),
+    }
+
+
+def _num_or_none(value):
+    try:
+        if value is None:
+            return None
+        return float(str(value).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return None
 
 
 # ── Meal state tracking ───────────────────────────────────────────────────
@@ -610,8 +916,11 @@ def build_diary_context(session):
 
 # ── Terminal chat mode ────────────────────────────────────────────────────
 
-def run_terminal_chat(reminder_times=None, summary_time=None):
+def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=None, io_lock=None, speaker=None):
     """Interactive terminal chat — the assistant asks about meals."""
+    if input_provider is None:
+        from voice_io import TextInputProvider
+        input_provider = TextInputProvider()
     print(f"\n{'═' * 50}")
     print(f"  Diet Assistant for {USER_NAME}")
     print(f"  {datetime.now().strftime('%A, %B %d %Y — %I:%M %p')}")
@@ -621,16 +930,22 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
     reminder_stop = threading.Event()
     summary_stop = threading.Event()
     snooze_state = {}  # shared with reminder thread: {meal_idx: datetime_to_recheck}
-    start_reminder_loop(session, reminder_times or [], reminder_stop, snooze_state)
+    start_reminder_loop(session, reminder_times or [], reminder_stop, snooze_state,
+                        io_lock, input_provider=input_provider, speaker=speaker)
     start_nightly_summary_loop(session, summary_time, summary_stop)
 
     unlogged = get_unlogged_meals(session)
 
-    if not unlogged:
-        opener = f"Hey {USER_NAME}! All your meals are logged for today. Nice work!"
-    else:
-        opener = f"Hey {USER_NAME}! Would you like to log any food?"
-    print(f"  Assistant: {opener}\n")
+    # In always-on mode, stay silent until wake word — no greeting
+    from voice_io import AlwaysOnInputProvider
+    always_on = isinstance(input_provider, AlwaysOnInputProvider)
+
+    if not always_on:
+        if not unlogged:
+            opener = f"Hey {USER_NAME}, all meals logged today, nice."
+        else:
+            opener = f"Hey {USER_NAME}, how can I be of assistance?"
+        print(f"  Assistant: {opener}\n")
 
     # ── State ──
     pending_meal_idx = None
@@ -639,6 +954,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
     pending_searched_foods = [] # foods resolved via MFP search fallback
     pending_search_metadata = None  # token/date from search_foods (for log_searched_food)
     pending_quantity = "1"      # number of servings to log (adjustable via corrections)
+    pending_item_quantities = {}  # optional per-food quantities, e.g. {"rice": 0.5}
     pending_all_foods = None    # all MFP foods for this meal (needed for POST)
     pending_metadata = None
     disambiguation_queue = []   # list of {"description": str, "options": [food_dicts]}
@@ -649,13 +965,14 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
 
     def reset_state():
         nonlocal pending_meal_idx, pending_foods, pending_searched_foods, pending_search_metadata
-        nonlocal pending_all_foods, pending_metadata, pending_quantity
+        nonlocal pending_all_foods, pending_metadata, pending_quantity, pending_item_quantities
         nonlocal disambiguation_queue, not_found, awaiting_confirmation, awaiting_pick, pick_options
         pending_meal_idx = None
         pending_foods = []
         pending_searched_foods = []
         pending_search_metadata = None
         pending_quantity = "1"
+        pending_item_quantities = {}
         pending_all_foods = None
         pending_metadata = None
         disambiguation_queue = []
@@ -682,13 +999,17 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
             show_confirmation()
 
     def show_confirmation():
-        """Show all resolved foods and ask to confirm."""
+        """Show all resolved foods and ask to confirm.
+
+        If ALL foods came from recents (no searched foods), auto-log 1 serving
+        without asking.  Only prompt for quantity when there are searched/unfamiliar
+        foods (e.g. Indian food estimation).
+        """
         nonlocal awaiting_confirmation
         if not pending_foods and not pending_searched_foods:
             if not_found:
                 descs = ", ".join(not_found)
-                print(f"\n  Assistant: Couldn't find matches for: {descs}")
-                print(f"  Assistant: They might not be in your MFP recents yet.\n")
+                print(f"\n  Assistant: Couldn't find: {descs}")
             reset_state()
             return
 
@@ -698,10 +1019,25 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
 
         if not_found:
             descs = ", ".join(not_found)
-            print(f"\n  Assistant: Heads up — couldn't find: {descs}")
+            print(f"\n  Assistant: Couldn't find: {descs}")
 
-        print(f"\n  Assistant: Ready to log to {meal_name}: {food_names}")
-        print(f"  Assistant: Go ahead? (yes/no)\n")
+        # Auto-log if everything matched from recents (known foods)
+        if pending_foods and not pending_searched_foods:
+            count = len(pending_foods)
+            _, _, logged_names, failed_names, any_success = commit_pending_logs()
+            if any_success:
+                print(f"\n  Assistant: Got it, logged {count} item(s) to {meal_name}.")
+                if failed_names:
+                    print(f"  Assistant: Couldn't log: {', '.join(failed_names)}")
+            else:
+                print(f"\n  Assistant: Something went wrong logging those.")
+            print(f"  Assistant: Anything else?\n")
+            reset_state()
+            return
+
+        # Searched/unfamiliar foods — ask about quantity
+        count = len(pending_foods) + len(pending_searched_foods)
+        print(f"\n  Assistant: Found {count} item(s) for {meal_name}. How much? (e.g. '1 katori', '1 plate', or 'yes' for 1 serving)\n")
         awaiting_confirmation = True
 
     def commit_pending_logs():
@@ -711,29 +1047,45 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
         logged_names = []
         failed_names = []
 
+        def quantity_for_food(food_name):
+            for k, v in pending_item_quantities.items():
+                if k.lower() in food_name.lower() or food_name.lower() in k.lower():
+                    return float(v)
+            try:
+                return float(pending_quantity)
+            except (ValueError, TypeError):
+                return 1.0
+
         if pending_foods:
             # Apply quantity override to the all_foods list entries that match selected foods
-            if pending_quantity != "1" and pending_all_foods:
+            if pending_all_foods:
                 selected_ids = {f["food_id"] for f in pending_foods}
                 for f in pending_all_foods:
                     if f["food_id"] in selected_ids:
-                        f["quantity"] = pending_quantity
+                        matched = next((x for x in pending_foods if x["food_id"] == f["food_id"]), None)
+                        if matched:
+                            f["quantity"] = str(quantity_for_food(matched["name"]))
             recent_success = log_foods(session, pending_foods, pending_all_foods, pending_meal_idx, pending_metadata)
             if recent_success:
-                qty_display = f" (x{pending_quantity})" if pending_quantity != "1" else ""
-                logged_names.extend([f["name"] + qty_display for f in pending_foods])
+                for f in pending_foods:
+                    q = quantity_for_food(f["name"])
+                    qty_display = f" (x{q:g})" if q != 1 else ""
+                    logged_names.append(f["name"] + qty_display)
             else:
                 failed_names.extend([f["name"] for f in pending_foods])
 
         for food in pending_searched_foods:
-            if log_searched_food(session, food, pending_meal_idx, pending_search_metadata, quantity=pending_quantity):
+            q = quantity_for_food(food["name"])
+            if log_searched_food(session, food, pending_meal_idx, pending_search_metadata, quantity=str(q)):
                 searched_success_count += 1
-                qty_display = f" (x{pending_quantity})" if pending_quantity != "1" else ""
+                qty_display = f" (x{q:g})" if q != 1 else ""
                 logged_names.append(food["name"] + qty_display)
             else:
                 failed_names.append(food["name"])
 
         any_success = len(logged_names) > 0
+        if any_success:
+            invalidate_recents_cache(pending_meal_idx)
         return recent_success, searched_success_count, logged_names, failed_names, any_success
 
     def start_food_matching(food_desc, meal_idx, rejected_names=None):
@@ -744,8 +1096,8 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
 
         last_meal_idx = meal_idx
         meal_name = MEALS[meal_idx]["name"]
-        print(f"\n  Assistant: Looking up your recent foods for {meal_name}...")
-        all_foods, metadata = get_recent_foods(session, meal_idx)
+        print(f"\n  Assistant: Checking {meal_name}...")
+        all_foods, metadata = get_recent_foods_cached(session, meal_idx)
 
         # Filter out recently rejected foods so they don't get re-matched
         if rejected_names and all_foods:
@@ -767,43 +1119,60 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                 desc = item.get("description", "")
 
                 if len(matches) == 1:
-                    pending_foods.append(all_foods[matches[0]])
+                    candidate = all_foods[matches[0]]
+                    if has_reasonable_recent_overlap(desc, [candidate["name"]]):
+                        pending_foods.append(candidate)
+                    else:
+                        not_found.append(desc)
                 elif len(matches) > 1:
-                    disambiguation_queue.append({
-                        "description": desc,
-                        "options": [all_foods[i] for i in matches],
-                    })
+                    options = [all_foods[i] for i in matches]
+                    option_names = [o["name"] for o in options]
+                    if has_reasonable_recent_overlap(desc, option_names):
+                        disambiguation_queue.append({
+                            "description": desc,
+                            "options": options,
+                        })
+                    else:
+                        not_found.append(desc)
                 else:
                     not_found.append(desc)
 
             if not match_results:
                 not_found.extend(split_food_descriptions(food_desc))
         else:
-            print(f"  Assistant: No recent foods found for {meal_name}. Trying full MFP search...")
+            print(f"  Assistant: Nothing in recents for {meal_name}, searching MFP...")
             not_found.extend(split_food_descriptions(food_desc))
 
         # Search fallback for items not in recents
         still_not_found = []
         for desc in not_found:
-            search_query = normalize_food_query(desc)
-            print(f"  Assistant: \"{desc}\" isn't in your recents. Searching MFP for \"{search_query}\"...")
-            search_results, search_meta = search_foods(session, search_query, meal_idx)
-            if search_meta and not pending_search_metadata:
-                pending_search_metadata = search_meta
-            if search_results:
-                best_match, confidence = match_search_results_with_gpt(search_query, search_results)
-                if best_match and confidence in ("high", "medium"):
-                    print(f"  Assistant: Found: {best_match['name']}")
-                    pending_searched_foods.append(best_match)
-                else:
-                    fallback = pick_reasonable_search_result(search_query, search_results)
-                    if fallback:
-                        print(f"  Assistant: Found likely match: {fallback['name']}")
-                        pending_searched_foods.append(fallback)
+            parts = split_compound_food_for_search(desc)
+            unresolved_parts = []
+            if len(parts) > 1:
+                print(f"  Assistant: Splitting \"{desc}\" into: {', '.join(parts)}")
+
+            for part in parts:
+                search_query = normalize_food_query(part)
+                print(f"  Assistant: Searching MFP for \"{search_query}\"...")
+                search_results, search_meta = search_foods(session, search_query, meal_idx)
+                if search_meta and not pending_search_metadata:
+                    pending_search_metadata = search_meta
+                if search_results:
+                    best_match, confidence = match_search_results_with_gpt(search_query, search_results)
+                    if best_match and confidence in ("high", "medium"):
+                        print(f"  Assistant: Found: {best_match['name']}")
+                        pending_searched_foods.append(best_match)
                     else:
-                        still_not_found.append(desc)
-            else:
-                still_not_found.append(desc)
+                        fallback = pick_reasonable_search_result(search_query, search_results)
+                        if fallback:
+                            print(f"  Assistant: Found likely match: {fallback['name']}")
+                            pending_searched_foods.append(fallback)
+                        else:
+                            unresolved_parts.append(part)
+                else:
+                    unresolved_parts.append(part)
+
+            still_not_found.extend(unresolved_parts)
         not_found = still_not_found
 
         # If there are disambiguations, start asking
@@ -813,16 +1182,37 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
     try:
         while True:
             try:
-                user_input = input(f"  {USER_NAME}: ").strip()
+                user_input = input_provider.get_input(f"  {USER_NAME}: ").strip()
             except (EOFError, KeyboardInterrupt):
                 print("\n\nBye!")
                 break
 
             if not user_input:
                 continue
-            if user_input.lower() in ("quit", "exit", "bye", "q"):
-                print("\n  Assistant: Later! Keep hitting those goals.\n")
-                break
+            lower_input_check = user_input.lower().strip()
+            goodbye_keywords = ("quit", "exit", "bye", "q")
+            goodbye_phrases = ["good day", "good night", "see you", "see ya", "talk later",
+                               "talk to you later", "gotta go", "i'm done", "that's all",
+                               "that's it", "peace", "later", "cya", "goodbye", "good bye",
+                               "have a good", "take care", "catch you later", "im out",
+                               "nope that's it", "nope thats it", "that should be it",
+                               "sounds good", "alright thanks", "all right thanks",
+                               "all right sounds good", "thanks that's it", "thank you",
+                               "thanks bye", "ok thanks", "ok bye", "okay bye",
+                               "perfect thanks", "cool thanks", "great thanks", "appreciate it"]
+            import string
+            clean_input = lower_input_check.translate(str.maketrans("", "", string.punctuation))
+            is_goodbye = (lower_input_check in goodbye_keywords or
+                          any(phrase in clean_input for phrase in goodbye_phrases))
+            if is_goodbye:
+                if always_on:
+                    # Don't exit — go back to passive wake word listening
+                    print("\n  Assistant: Talk to you later! Say 'Hey Claude' when you need me.\n")
+                    reset_state()
+                    continue
+                else:
+                    print("\n  Assistant: Talk to you later!\n")
+                    break
 
             # ── Picking from disambiguation options ──
             if awaiting_pick:
@@ -845,27 +1235,179 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
 
             # ── Confirmation flow ──
             if awaiting_confirmation:
-                # Build pending food info for context
+                # Fast path: household quantity expressions (katori/plate/bowl).
+                qty_parse = parse_household_quantity_to_servings(user_input)
+                if qty_parse:
+                    servings, unit, amount, base = qty_parse
+                    pending_quantity = str(servings)
+                    print(
+                        f"\n  Assistant: Got it — {amount:g} {unit} "
+                        f"(~{base:g} serving each) => {servings:g} serving(s)."
+                    )
+                    print("  Assistant: Go ahead? (yes/no)\n")
+                    continue
+
+                # Build pending food info for context (scaled by current quantity choices)
                 pending_info_parts = []
                 pending_names = []
+                total_cal = 0.0
+                total_protein = 0.0
+                total_cal_known = False
+                total_protein_known = False
+
+                def qty_for_display(food_name):
+                    for k, v in pending_item_quantities.items():
+                        if k.lower() in food_name.lower() or food_name.lower() in k.lower():
+                            try:
+                                return float(v)
+                            except (ValueError, TypeError):
+                                return 1.0
+                    try:
+                        return float(pending_quantity)
+                    except (ValueError, TypeError):
+                        return 1.0
+
                 for f in pending_foods:
                     info = f"- {f['name']}"
                     pending_names.append(f['name'])
+                    q = qty_for_display(f["name"])
+                    cal_val = None
+                    protein_val = None
+                    try:
+                        cal_val = float(str(f.get("calories", "")).replace(",", ""))
+                    except (ValueError, TypeError):
+                        cal_val = None
+                    try:
+                        protein_val = float(str(f.get("protein", "")).replace(",", ""))
+                    except (ValueError, TypeError):
+                        protein_val = None
+
+                    if q != 1:
+                        info += f" (x{q:g})"
+
                     if f.get("calories"):
-                        info += f" (Calories: {f['calories']}"
-                        if f.get("protein"):
-                            info += f", Protein: {f['protein']}g"
-                        info += ")"
+                        scaled_cal = cal_val * q if cal_val is not None else None
+                        scaled_protein = protein_val * q if protein_val is not None else None
+                        details = []
+                        if scaled_cal is not None:
+                            details.append(f"Calories: {scaled_cal:.0f}")
+                            total_cal += scaled_cal
+                            total_cal_known = True
+                        if scaled_protein is not None:
+                            details.append(f"Protein: {scaled_protein:.1f}g")
+                            total_protein += scaled_protein
+                            total_protein_known = True
+                        if details:
+                            info += " [" + ", ".join(details) + "]"
                     pending_info_parts.append(info)
+
                 for f in pending_searched_foods:
                     info = f"- {f['name']}"
                     pending_names.append(f['name'])
+                    q = qty_for_display(f["name"])
+                    if q != 1:
+                        info += f" (x{q:g})"
+
+                    parsed_nutri = parse_nutrition_from_cal_info(f.get("cal_info"))
+                    scaled_cal = parsed_nutri["calories"] * q if parsed_nutri["calories"] is not None else None
+                    scaled_protein = parsed_nutri["protein"] * q if parsed_nutri["protein"] is not None else None
+
                     if f.get("cal_info"):
                         info += f" ({f['cal_info']})"
+                    details = []
+                    if scaled_cal is not None:
+                        details.append(f"Calories: {scaled_cal:.0f}")
+                        total_cal += scaled_cal
+                        total_cal_known = True
+                    if scaled_protein is not None:
+                        details.append(f"Protein: {scaled_protein:.1f}g")
+                        total_protein += scaled_protein
+                        total_protein_known = True
+                    if details:
+                        info += " [" + ", ".join(details) + "]"
                     pending_info_parts.append(info)
 
                 pending_info = "\n".join(pending_info_parts) if pending_info_parts else "No nutrition info available."
                 meal_name = MEALS[pending_meal_idx]["name"]
+                totals_line_parts = []
+                if total_cal_known:
+                    totals_line_parts.append(f"Calories: {total_cal:.0f}")
+                if total_protein_known:
+                    totals_line_parts.append(f"Protein: {total_protein:.1f}g")
+                if totals_line_parts:
+                    pending_info += "\n\nEstimated total for selected quantities: " + ", ".join(totals_line_parts)
+
+                # Deterministic macro Q&A path while awaiting confirmation.
+                lower_input = user_input.lower()
+                asks_macros = any(k in lower_input for k in ["macro", "calorie", "protein", "carb", "fat"])
+                if asks_macros:
+                    totals = {"calories": 0.0, "protein": 0.0, "carbs": 0.0, "fat": 0.0}
+                    known = {"calories": False, "protein": False, "carbs": False, "fat": False}
+
+                    def qty_for_macro(food_name):
+                        for k, v in pending_item_quantities.items():
+                            if k.lower() in food_name.lower() or food_name.lower() in k.lower():
+                                try:
+                                    return float(v)
+                                except (ValueError, TypeError):
+                                    return 1.0
+                        try:
+                            return float(pending_quantity)
+                        except (ValueError, TypeError):
+                            return 1.0
+
+                    for f in pending_foods:
+                        q = qty_for_macro(f["name"])
+                        vals = {
+                            "calories": _num_or_none(f.get("calories")),
+                            "protein": _num_or_none(f.get("protein")),
+                            "carbs": _num_or_none(f.get("carbs")),
+                            "fat": _num_or_none(f.get("fat")),
+                        }
+                        for k, v in vals.items():
+                            if v is not None:
+                                totals[k] += v * q
+                                known[k] = True
+
+                    for f in pending_searched_foods:
+                        q = qty_for_macro(f["name"])
+                        vals = parse_nutrition_from_cal_info(f.get("cal_info"))
+                        for k, v in vals.items():
+                            if v is not None:
+                                totals[k] += v * q
+                                known[k] = True
+
+                    lines = []
+                    if known["calories"]:
+                        lines.append(f"- Calories: {totals['calories']:.0f}")
+                    if known["protein"]:
+                        lines.append(f"- Protein: {totals['protein']:.1f} g")
+                    if known["carbs"]:
+                        lines.append(f"- Carbs: {totals['carbs']:.1f} g")
+                    if known["fat"]:
+                        lines.append(f"- Fat: {totals['fat']:.1f} g")
+
+                    if lines:
+                        print("\n  Assistant: Estimated macros:")
+                        for line in lines:
+                            print(f"  {line}")
+                        missing = [k for k, v in known.items() if not v]
+                        if missing:
+                            print(f"  Assistant: No data for: {', '.join(missing)}.")
+                        print("\n  Assistant: Yes to log, no to cancel.\n")
+                    else:
+                        print("\n  Assistant: No macro data available for these.")
+                        print("  Assistant: Yes to log, no to cancel.\n")
+                    continue
+
+                # Per-food quantity instruction (e.g. "1 serving channay and 1/2 serving rice")
+                per_food_qty = parse_per_food_quantities_with_gpt(user_input, pending_names)
+                if per_food_qty:
+                    pending_item_quantities = per_food_qty
+                    pairs = ", ".join([f"{k}: {v:g} serving(s)" for k, v in per_food_qty.items()])
+                    print(f"\n  Assistant: Got it — {pairs}.")
+                    print("  Assistant: Go ahead? (yes/no)\n")
+                    continue
 
                 # Single GPT call to understand what the user wants
                 confirm_resp = client.chat.completions.create(
@@ -910,6 +1452,9 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                                 "it's an adjust_qty or correction\n"
                                 "- If they say 'log X servings' or 'I had X servings' or 'X of these', "
                                 "that is adjust_qty with quantity=X. The quantity is the NUMBER they say, not divided by anything.\n"
+                                "- If they mention katori/bowl/plate, convert approximately:\n"
+                                "  katori ≈ 0.75 servings, bowl ≈ 1 serving, plate ≈ 1.5 servings.\n"
+                                "  Example: '1-2 katori' => about 1.125 servings.\n"
                                 "- If they specify a physical amount (e.g. '4 oz') and the entry has a different amount (e.g. '2 oz'), "
                                 "divide to get quantity (4/2=2)\n"
                                 "- 'double' = quantity 2, 'triple' = quantity 3, 'half' = quantity 0.5\n"
@@ -932,17 +1477,15 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                 if action == "confirm":
                     _, _, logged_names, failed_names, any_success = commit_pending_logs()
                     if any_success:
-                        food_names = ", ".join(logged_names)
-                        print(f"\n  Assistant: Done! Logged to {meal_name}: {food_names}.")
+                        print(f"\n  Assistant: Done, logged to {meal_name}.")
                         if failed_names:
-                            print(f"  Assistant: Couldn't auto-log: {', '.join(failed_names)}")
+                            print(f"  Assistant: Couldn't log: {', '.join(failed_names)}")
                     elif failed_names:
-                        print(f"\n  Assistant: I couldn't auto-log: {', '.join(failed_names)}")
+                        print(f"\n  Assistant: Couldn't log: {', '.join(failed_names)}")
                     else:
                         print(f"\n  Assistant: Something went wrong. Check MFP.")
                     reset_state()
-                    # Keep last_meal_idx so follow-ups like "also log X" stay on the same meal
-                    print(f"  Assistant: Want to log anything else?\n")
+                    print(f"  Assistant: Anything else?\n")
                     continue
 
                 # ── REJECT (optionally with replacement food) ──
@@ -953,10 +1496,10 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                     rejected += [f["name"] for f in pending_searched_foods]
                     reset_state()
                     if replacement:
-                        print(f"\n  Assistant: Got it, canceling that. Let me look up {replacement}...")
+                        print(f"\n  Assistant: Ok, looking up {replacement} instead...")
                         start_food_matching(replacement, saved_meal_idx, rejected_names=rejected)
                     else:
-                        print(f"\n  Assistant: No worries. Tell me what you had and I'll try again.\n")
+                        print(f"\n  Assistant: Ok, what'd you have instead?\n")
                     continue
 
                 # ── ADJUST QUANTITY (same food, different number of servings) ──
@@ -978,7 +1521,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                         print(f"\n  Assistant: Got it — logging {qty_display} serving(s) of {food_name}{cal_info}.")
                         print(f"  Assistant: Go ahead? (yes/no)\n")
                     else:
-                        print(f"\n  Assistant: I couldn't figure out the quantity. How many servings did you have?\n")
+                        print(f"\n  Assistant: Didn't catch that — how many servings?\n")
                     continue
 
                 # ── ADD MORE (confirm current + search for additional foods) ──
@@ -1069,10 +1612,10 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                             print(f"  Assistant: Go ahead? (yes/no)\n")
                         else:
                             print(f"  Assistant: Couldn't find an entry close to {target_display}.")
-                            print(f"  Assistant: You can say yes to log the current one, or no to cancel.\n")
+                            print(f"  Assistant: Say yes to log current one, or no to cancel.\n")
                     else:
-                        print(f"  Assistant: No results found for \"{search_query}\".")
-                        print(f"  Assistant: You can say yes to log the current one, or no to cancel.\n")
+                        print(f"  Assistant: No results for \"{search_query}\".")
+                        print(f"  Assistant: Say yes to log current one, or no to cancel.\n")
                     continue
 
                 # ── QUESTION (answer about the pending food) ──
@@ -1081,7 +1624,8 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                         f"The user is about to log these foods to {meal_name} and has a question.\n"
                         f"Pending foods:\n{pending_info}\n\n"
                         f"User question: {user_input}\n\n"
-                        f"Answer their question about the pending food(s) based on the info above. "
+                        f"Answer their question about the pending food(s) based ONLY on the info above. "
+                        f"If a macro is missing from the data, say it's not available instead of guessing. "
                         f"Be concise. After answering, remind them they can say yes to log or no to cancel."
                     )
                     resp = client.chat.completions.create(
@@ -1101,13 +1645,24 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
             intent = parsed.get("intent", "chat")
             mentioned_meal = parsed.get("meal")
             food_desc = parsed.get("foods")
+            preset_name = parsed.get("preset_name")
+            sub_action = parsed.get("sub_action")
+
+            # Guardrail: GPT can misclassify "add X to lunch/dinner" as preset management.
+            # If no preset name is provided, treat meal+food phrasing as normal diary logging.
+            if intent in ("manage_meal", "log_meal") and not preset_name:
+                if mentioned_meal and food_desc:
+                    if intent == "manage_meal" and sub_action == "remove_food":
+                        intent = "remove"
+                    else:
+                        intent = "log"
 
             # ── Skip intent ──
             if intent == "skip":
                 if mentioned_meal and mentioned_meal in MEAL_NAMES_TO_IDX:
                     print(f"\n  Assistant: Got it, skipping {mentioned_meal.title()}.\n")
                 else:
-                    print(f"\n  Assistant: No problem. Let me know when you're ready.\n")
+                    print(f"\n  Assistant: No problem, lmk when you're ready.\n")
                 continue
 
             # ── Defer intent (snooze reminder for 1 hour) ──
@@ -1117,7 +1672,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                 if mentioned_meal and mentioned_meal in MEAL_NAMES_TO_IDX:
                     meal_idx = MEAL_NAMES_TO_IDX[mentioned_meal]
                     snooze_state[meal_idx] = wake_time
-                    print(f"\n  Assistant: No worries! I'll check back about {mentioned_meal.lower()} in an hour.\n")
+                    print(f"\n  Assistant: Got it, I'll check back about {mentioned_meal.lower()} in an hour.\n")
                 else:
                     # Snooze all currently unlogged meals
                     try:
@@ -1128,9 +1683,9 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                         for idx, name in unlogged:
                             snooze_state[idx] = wake_time
                         names = ", ".join(n.lower() for _, n in unlogged)
-                        print(f"\n  Assistant: No worries! I'll check back about {names} in an hour.\n")
+                        print(f"\n  Assistant: Got it, I'll check back about {names} in an hour.\n")
                     else:
-                        print(f"\n  Assistant: All your meals are already logged! Nothing to defer.\n")
+                        print(f"\n  Assistant: All meals are logged already.\n")
                 continue
 
             # ── Remove intent ──
@@ -1169,15 +1724,17 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
 
                     # Inline yes/no for remove
                     try:
-                        confirm = input(f"  {USER_NAME}: ").strip().lower()
+                        confirm = input_provider.get_input(f"  {USER_NAME}: ").strip().lower()
                     except (EOFError, KeyboardInterrupt):
                         break
-                    confirm_words = set(confirm.split())
+                    confirm_words = set(w.strip(".,!?;:'\"") for w in confirm.split())
                     if confirm_words & {"yes", "y", "yeah", "yep", "yup", "sure", "ok", "do", "please"}:
                         removed = 0
                         for f in candidates:
                             if f.get("entry_id") and remove_food(session, f["entry_id"]):
                                 removed += 1
+                        if removed:
+                            invalidate_recents_cache()
                         print(f"\n  Assistant: Done! Removed {removed} item(s).\n")
                     else:
                         print(f"\n  Assistant: No worries, kept everything.\n")
@@ -1219,15 +1776,17 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                 print(f"\n  Assistant: Remove: {food_names}? (yes/no)\n")
 
                 try:
-                    confirm = input(f"  {USER_NAME}: ").strip().lower()
+                    confirm = input_provider.get_input(f"  {USER_NAME}: ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     break
-                confirm_words = set(confirm.split())
+                confirm_words = set(w.strip(".,!?;:'\"") for w in confirm.split())
                 if confirm_words & {"yes", "y", "yeah", "yep", "yup", "sure", "ok", "do", "please"}:
                     removed = 0
                     for f in to_remove:
                         if f.get("entry_id") and remove_food(session, f["entry_id"]):
                             removed += 1
+                    if removed:
+                        invalidate_recents_cache()
                     print(f"\n  Assistant: Done! Removed {removed} item(s).\n")
                 else:
                     print(f"\n  Assistant: Kept everything as is.\n")
@@ -1239,7 +1798,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                 if not preset_name:
                     print(f"\n  Assistant: What do you want to call this meal preset?\n")
                     try:
-                        preset_name = input(f"  {USER_NAME}: ").strip()
+                        preset_name = input_provider.get_input(f"  {USER_NAME}: ").strip()
                     except (EOFError, KeyboardInterrupt):
                         break
                     if not preset_name:
@@ -1251,7 +1810,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                 if not food_list_str:
                     print(f"\n  Assistant: What foods go in \"{preset_name}\"?\n")
                     try:
-                        food_list_str = input(f"  {USER_NAME}: ").strip()
+                        food_list_str = input_provider.get_input(f"  {USER_NAME}: ").strip()
                     except (EOFError, KeyboardInterrupt):
                         break
                     if not food_list_str:
@@ -1309,7 +1868,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                     servings = str(item.get("servings", 1))
 
                     # First try recent foods
-                    all_foods, metadata = get_recent_foods(session, meal_idx)
+                    all_foods, metadata = get_recent_foods_cached(session, meal_idx)
                     if all_foods:
                         match_results = match_foods_with_gpt(name, all_foods)
                         if match_results and match_results[0].get("matches"):
@@ -1345,6 +1904,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                     print(f"    Failed: {name}")
 
                 if logged:
+                    invalidate_recents_cache(meal_idx)
                     print(f"  Assistant: Done! Logged {len(logged)}/{len(foods)} foods to {meal_name}.")
                 else:
                     print(f"  Assistant: Couldn't log any foods from \"{matched_name}\".")
@@ -1384,7 +1944,8 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                         save_presets(presets)
                         print(f"\n  Assistant: Deleted \"{matched_name}\".\n")
                     else:
-                        print(f"\n  Assistant: No preset found matching \"{preset_name}\".\n")
+                        show_name = preset_name or "(missing preset name)"
+                        print(f"\n  Assistant: No preset found matching \"{show_name}\".\n")
                     continue
 
                 elif sub == "add_food" and food_desc:
@@ -1397,7 +1958,8 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                         save_presets(presets)
                         print(f"\n  Assistant: Added {', '.join(new_foods)} to \"{matched_name}\".\n")
                     else:
-                        print(f"\n  Assistant: No preset found matching \"{preset_name}\".\n")
+                        show_name = preset_name or "(missing preset name)"
+                        print(f"\n  Assistant: No preset found matching \"{show_name}\".\n")
                     continue
 
                 elif sub == "remove_food" and food_desc:
@@ -1417,7 +1979,8 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
                         else:
                             print(f"\n  Assistant: No food matching \"{food_desc}\" found in \"{matched_name}\".\n")
                     else:
-                        print(f"\n  Assistant: No preset found matching \"{preset_name}\".\n")
+                        show_name = preset_name or "(missing preset name)"
+                        print(f"\n  Assistant: No preset found matching \"{show_name}\".\n")
                     continue
 
                 continue
@@ -1466,8 +2029,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None):
             if intent == "chat":
                 lower = user_input.lower()
                 if any(w in lower for w in ["help", "how do i", "how does"]):
-                    print(f"\n  Assistant: Just tell me what you ate! Like \"I had chicken and rice for dinner\".")
-                    print(f"  Assistant: I'll match it to your MFP foods and log it.\n")
+                    print(f"\n  Assistant: Just tell me what you ate, like \"chicken and rice for dinner\".\n")
                     continue
 
                 context = build_diary_context(session)
@@ -1500,6 +2062,14 @@ def main():
         help="HH:MM time to text daily diet summary (default 23:49)",
     )
     parser.add_argument("--no-summary", action="store_true", help="Disable nightly summary text")
+    parser.add_argument("--voice-input", action="store_true",
+                        help="Enable microphone input with local Whisper STT (implies --voice)")
+    parser.add_argument("--always-on", action="store_true",
+                        help="Always-on mode — listens for wake word, then processes command (implies --voice)")
+    parser.add_argument("--wake-phrase", type=str, default="hey claude",
+                        help="Wake phrase for always-on mode (default: 'hey claude')")
+    parser.add_argument("--whisper-model", type=str, default="base",
+                        help="Whisper model size: tiny, base, small, medium (default: base)")
     parser.add_argument("--test-sms", action="store_true", help="Send a test SMS and exit (to verify Twilio config)")
     args = parser.parse_args()
 
@@ -1524,11 +2094,39 @@ def main():
         print("Add it like: OPENAI_API_KEY=sk-...")
         sys.exit(1)
 
+    # Always-on implies voice-input implies voice
+    if args.always_on:
+        args.voice_input = True
+    if args.voice_input:
+        args.voice = True
+
     speaker = Speaker(enabled=args.voice, voice_name=args.voice_name)
     original_stdout = sys.stdout
+    uses_mic = args.voice_input or args.always_on
     if speaker.enabled:
-        sys.stdout = AssistantSpeechInterceptor(sys.stdout, speaker)
-        print("Voice mode enabled. Assistant replies will be spoken on your current audio output.")
+        sys.stdout = AssistantSpeechInterceptor(
+            sys.stdout, speaker, blocking=uses_mic
+        )
+
+    # Build input provider
+    io_lock = threading.Lock() if uses_mic else None
+    if args.always_on:
+        from voice_io import AlwaysOnInputProvider
+        input_provider = AlwaysOnInputProvider(
+            whisper_model=args.whisper_model,
+            wake_phrase=args.wake_phrase,
+            io_lock=io_lock,
+            speaker=speaker,
+        )
+    elif args.voice_input:
+        from voice_io import VoiceInputProvider
+        input_provider = VoiceInputProvider(
+            whisper_model=args.whisper_model,
+            io_lock=io_lock,
+        )
+    else:
+        from voice_io import TextInputProvider
+        input_provider = TextInputProvider()
 
     reminder_times = [] if args.no_reminders else parse_reminder_times(args.reminder_times)
     if reminder_times:
@@ -1539,8 +2137,15 @@ def main():
         print(f"Nightly summary text at: {summary_time}")
 
     try:
-        run_terminal_chat(reminder_times=reminder_times, summary_time=summary_time)
+        run_terminal_chat(
+            reminder_times=reminder_times,
+            summary_time=summary_time,
+            input_provider=input_provider,
+            io_lock=io_lock,
+            speaker=speaker,
+        )
     finally:
+        input_provider.cleanup()
         if speaker.enabled:
             sys.stdout = original_stdout
 

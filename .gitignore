@@ -11,3 +11,4 @@ tmp_*.html
 chromedriver.log
 *.pyc
 .DS_Store
+release/

@@ -1,0 +1,48 @@
+{
+  "interactionModel": {
+    "languageModel": {
+      "invocationName": "diet assistant",
+      "intents": [
+        {
+          "name": "CatchAllIntent",
+          "slots": [
+            {
+              "name": "userCommand",
+              "type": "AMAZON.SearchQuery"
+            }
+          ],
+          "samples": [
+            "to {userCommand}",
+            "tell me {userCommand}",
+            "please {userCommand}",
+            "can you {userCommand}",
+            "I want to {userCommand}",
+            "I need to {userCommand}",
+            "help me {userCommand}",
+            "log {userCommand}",
+            "add {userCommand}",
+            "remove {userCommand}",
+            "what is {userCommand}",
+            "how many {userCommand}"
+          ]
+        },
+        {
+          "name": "AMAZON.HelpIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.CancelIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.StopIntent",
+          "samples": []
+        },
+        {
+          "name": "AMAZON.FallbackIntent",
+          "samples": []
+        }
+      ]
+    }
+  }
+}

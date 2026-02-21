@@ -1,0 +1,4 @@
+#!/bin/bash
+cd "/Users/aguha2021/Desktop/CS_Projects/Claude Bot Gym"
+source venv/bin/activate
+exec python hotkey_assistant.py

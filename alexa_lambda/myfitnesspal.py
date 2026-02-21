@@ -302,16 +302,11 @@ def get_recent_foods(session, meal_idx):
         )
         quantity = qty_input[0] if qty_input else "1"
 
-        # Get the default weight_id and serving description from the select element
+        # Get the default weight_id from the select element
         weight_select = tree.xpath(
             f"//select[@name='favorites[{index}][weight_id]']//option[@selected]/@value"
         )
         weight_id = weight_select[0] if weight_select else "0"
-
-        serving_desc_el = tree.xpath(
-            f"//select[@name='favorites[{index}][weight_id]']//option[@selected]"
-        )
-        serving_desc = serving_desc_el[0].text_content().strip() if len(serving_desc_el) else ""
 
         foods.append({
             "name": food_name,
@@ -319,7 +314,6 @@ def get_recent_foods(session, meal_idx):
             "index": index,
             "quantity": quantity,
             "weight_id": weight_id,
-            "serving_desc": serving_desc,
         })
 
     # Also extract the authenticity_token and date from the form
@@ -562,33 +556,6 @@ def send_sms(body):
             print(f"  [sms] Failed to send to {phone}: {e}")
 
     return any_ok
-
-
-def send_sms_to(body, phone):
-    """Send an iMessage to a single phone number. Returns True if succeeded."""
-    import subprocess
-
-    escaped_body = body.replace("\\", "\\\\").replace('"', '\\"')
-    try:
-        script = f'''
-        tell application "Messages"
-            set targetService to 1st account whose service type = iMessage
-            set targetBuddy to participant "{phone}" of targetService
-            send "{escaped_body}" to targetBuddy
-        end tell
-        '''
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=15
-        )
-        if result.returncode == 0:
-            print(f"  [sms] Sent iMessage to {phone}")
-            return True
-        else:
-            print(f"  [sms] Failed to send to {phone}: {result.stderr.strip()}")
-    except Exception as e:
-        print(f"  [sms] Failed to send to {phone}: {e}")
-    return False
 
 
 def build_daily_summary(session, target_date=None):

@@ -6,8 +6,8 @@ Talks to you about meals, understands natural language ("I had a protein bar
 and chai"), matches against your MFP recent foods, and logs them.
 
 Modes:
-  python assistant.py              — Terminal chat mode
-  python assistant.py --sms        — Twilio SMS server mode (coming soon)
+  python assistant.py              — Terminal chat mode (typing)
+  python hotkey_assistant.py       — Push-to-talk mode (hold Option key)
 
 Requires: OPENAI_API_KEY in .env
 """
@@ -100,9 +100,10 @@ def parse_reminder_times(raw):
 
 class Speaker:
     """Simple TTS wrapper that uses local OS commands."""
-    def __init__(self, enabled=False, voice_name=None):
+    def __init__(self, enabled=False, voice_name=None, default_volume=65):
         self.enabled = enabled
         self.voice_name = voice_name
+        self.default_volume = max(0, min(100, int(default_volume)))
         self.backend = None
 
         if not enabled:
@@ -137,33 +138,44 @@ class Speaker:
         if not self.enabled or not text:
             return
         try:
-            self._set_volume(100)
             subprocess.Popen(self._build_cmd(text),
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
 
-    def speak_and_wait(self, text, volume=100):
-        """Blocking TTS — waits until speech finishes. Required for voice-input
-        mode so the mic doesn't open while TTS is still playing."""
+    def speak_and_wait(self, text, volume=None):
+        """Blocking TTS — waits until speech finishes."""
         if not self.enabled or not text:
             return
         try:
-            self._set_volume(volume)
+            if volume is not None:
+                self._set_volume(volume)
             subprocess.run(self._build_cmd(text),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.3)  # Let audio output buffer drain
+            if volume is not None:
+                self._set_volume(self.default_volume)
         except Exception:
             pass
 
 
 class AssistantSpeechInterceptor:
-    """Intercept stdout and speak lines that contain `Assistant:`."""
-    def __init__(self, wrapped, speaker, blocking=False):
+    """Intercept stdout and speak lines that contain `Assistant:`.
+
+    If input_provider is set, only speaks when the last input was voice
+    (Option key push-to-talk).
+    """
+    def __init__(self, wrapped, speaker, input_provider=None):
         self.wrapped = wrapped
         self.speaker = speaker
-        self.blocking = blocking  # True when voice input is active
+        self.input_provider = input_provider
         self._buffer = ""
+
+    def _should_speak(self):
+        """Only speak if last input was from voice (Option key)."""
+        if self.input_provider is None:
+            return True
+        return getattr(self.input_provider, 'last_was_voice', False)
 
     def write(self, data):
         self.wrapped.write(data)
@@ -171,12 +183,12 @@ class AssistantSpeechInterceptor:
 
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            if "Assistant:" in line:
+            if "Assistant:" in line and self._should_speak():
                 spoken = line.split("Assistant:", 1)[1].strip()
-                if self.blocking:
-                    self.speaker.speak_and_wait(spoken)
-                else:
-                    self.speaker.speak(spoken)
+                # Keep spoken output concise: don't read parenthetical text.
+                spoken = re.sub(r"\([^)]*\)", "", spoken)
+                spoken = re.sub(r"\s+", " ", spoken).strip()
+                self.speaker.speak_and_wait(spoken, volume=50)
 
     def flush(self):
         self.wrapped.flush()
@@ -229,39 +241,8 @@ def start_reminder_loop(session, reminder_times, stop_event, snooze_state,
             return "?", "?"
 
     def _say(msg):
-        """Print a reminder message and optionally speak it.
-
-        In always-on mode: speak at volume 10, then open a 15-second
-        response window so the user can reply without saying 'Hey Claude'.
-        """
-        from voice_io import AlwaysOnInputProvider
-        is_always_on = isinstance(input_provider, AlwaysOnInputProvider)
-
-        if is_always_on and speaker:
-            # Speak directly at low volume instead of going through interceptor
-            if io_lock:
-                io_lock.acquire()
-            try:
-                # Extract spoken text from the "Assistant: ..." format
-                spoken = msg.strip()
-                if "Assistant:" in spoken:
-                    spoken = spoken.split("Assistant:", 1)[1].strip()
-                speaker.speak_and_wait(spoken, volume=10)
-                # Print (but interceptor will also try to speak — we need to
-                # temporarily suppress it). Just print to wrapped stdout.
-                original = getattr(sys.stdout, 'wrapped', sys.stdout)
-                original.write(msg + "\n" if not msg.endswith("\n") else msg)
-                original.flush()
-            finally:
-                if io_lock:
-                    io_lock.release()
-            # Open response window — user has 15 seconds to reply
-            input_provider.open_reminder_response_window(15)
-        elif io_lock:
-            with io_lock:
-                print(msg)
-        else:
-            print(msg)
+        """Print a reminder message."""
+        print(msg)
 
     def _loop():
         while not stop_event.is_set():
@@ -592,6 +573,24 @@ def split_compound_food_for_search(food_text):
     if not raw:
         return []
 
+    # Keep known compound dish names as a single searchable item.
+    # These frequently get over-split into ingredients and produce bad matches.
+    protected_dishes = {
+        "palak paneer",
+        "saag paneer",
+        "shahi paneer",
+        "matar paneer",
+        "paneer tikka masala",
+        "dal makhani",
+        "aloo gobi",
+        "chole bhature",
+        "chana masala",
+        "butter chicken",
+        "chicken tikka masala",
+    }
+    if raw.lower() in protected_dishes:
+        return [raw]
+
     # Fast path: obvious separators.
     quick_parts = re.split(r",| and | with |&|\/|\+", raw, flags=re.IGNORECASE)
     quick_parts = [p.strip() for p in quick_parts if p and p.strip()]
@@ -630,6 +629,7 @@ def split_compound_food_for_search(food_text):
                         "Examples:\n"
                         '- "channay chawal" -> ["channay", "rice"]\n'
                         '- "rajma chawal" -> ["rajma", "rice"]\n'
+                        '- "palak paneer" -> ["palak paneer"]\n'
                         '- "protein bar" -> ["protein bar"]\n'
                         "If it is one item, return one string in the array."
                     ),
@@ -711,14 +711,21 @@ def _tokenize_food_text(text):
 
 
 def has_reasonable_recent_overlap(description, candidate_names):
-    """Reject clearly unrelated recent-food matches before asking user to pick."""
+    """Reject clearly unrelated recent-food matches before asking user to pick.
+
+    Requires at least half the description tokens to match at least one candidate.
+    E.g. "tandoori curry pizza" (3 tokens) needs >=2 matching tokens, so
+    "chicken curry" (only 1 shared token) gets rejected.
+    """
     desc_tokens = _tokenize_food_text(description)
     if not desc_tokens:
         return True
 
-    # Require at least one shared token with at least one candidate.
+    min_overlap = max(1, (len(desc_tokens) + 1) // 2)  # ceiling division
+
     for name in candidate_names:
-        if desc_tokens & _tokenize_food_text(name):
+        shared = desc_tokens & _tokenize_food_text(name)
+        if len(shared) >= min_overlap:
             return True
     return False
 
@@ -729,12 +736,19 @@ def pick_reasonable_search_result(search_query, search_results):
     best = None
     best_score = -10**9
 
+    q_tokens = _tokenize_food_text(q)
+    generic_names = {
+        "cooked", "raw", "steamed", "roasted", "fried",
+        "boiled", "baked", "grilled", "food", "item",
+    }
+
     for item in search_results:
         name = item.get("name", "").strip()
         if not name:
             continue
         lower = name.lower()
         score = 0
+        n_tokens = _tokenize_food_text(lower)
 
         if lower == q:
             score += 8
@@ -742,16 +756,57 @@ def pick_reasonable_search_result(search_query, search_results):
             score += 5
         if q in lower:
             score += 3
+        if q_tokens and (q_tokens & n_tokens):
+            score += 4
+        else:
+            score -= 6
         if " - " in name:
             score -= 3
         if any(tag in lower for tag in ("raw", "cooked", "steamed", "roasted")):
             score += 1
+        if lower in generic_names or (len(n_tokens) == 1 and next(iter(n_tokens), "") in generic_names):
+            score -= 8
 
         if score > best_score:
             best_score = score
             best = item
 
+    if best is None:
+        return None
+
+    # Final guard: don't return clearly generic/no-overlap names.
+    best_name = best.get("name", "").lower()
+    best_tokens = _tokenize_food_text(best_name)
+    if q_tokens and not (q_tokens & best_tokens):
+        return None
+    if best_name in generic_names:
+        return None
+
     return best
+
+
+def pick_meal_bundle_results(search_query, search_results, max_items=6):
+    """Pick multiple search results when user asks to log a named 'meal'."""
+    q = (search_query or "").lower()
+    if "meal" not in q:
+        return []
+
+    stop = {"meal", "combo", "plate", "bowl", "box", "set"}
+    q_tokens = [t for t in _tokenize_food_text(q) if t not in stop]
+    if not q_tokens:
+        return []
+
+    bundle = []
+    for item in search_results:
+        name = (item.get("name") or "").lower()
+        if not name:
+            continue
+        if any(tok in name for tok in q_tokens):
+            bundle.append(item)
+        if len(bundle) >= max_items:
+            break
+
+    return bundle if len(bundle) >= 2 else []
 
 
 def smart_reply(user_input, diary_context):
@@ -792,6 +847,12 @@ def parse_per_food_quantities_with_gpt(user_input, pending_names):
                         "Extract per-food serving quantities from the user's sentence.\n"
                         "You are given the pending food names. Return ONLY JSON object mapping food name to quantity.\n"
                         "Use decimal numbers. Handle fractions like 1/2 -> 0.5.\n"
+                        "Convert household units to servings when present:\n"
+                        "- katori = 0.75 servings\n"
+                        "- bowl = 1.0 servings\n"
+                        "- plate = 1.5 servings\n"
+                        "Examples:\n"
+                        '- "2 rotis, 1 katori palak paneer, 1 katori karela" => {"rotis": 2, "palak paneer": 0.75, "karela": 0.75}\n'
                         "If no explicit per-food quantities are present, return {}.\n"
                         "Only include foods from the pending list."
                     ),
@@ -936,16 +997,11 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
 
     unlogged = get_unlogged_meals(session)
 
-    # In always-on mode, stay silent until wake word — no greeting
-    from voice_io import AlwaysOnInputProvider
-    always_on = isinstance(input_provider, AlwaysOnInputProvider)
-
-    if not always_on:
-        if not unlogged:
-            opener = f"Hey {USER_NAME}, all meals logged today, nice."
-        else:
-            opener = f"Hey {USER_NAME}, how can I be of assistance?"
-        print(f"  Assistant: {opener}\n")
+    if not unlogged:
+        opener = f"Hey {USER_NAME}, all meals logged today, nice."
+    else:
+        opener = f"Hey {USER_NAME}, how can I be of assistance?"
+    print(f"  Assistant: {opener}\n")
 
     # ── State ──
     pending_meal_idx = None
@@ -980,6 +1036,32 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
         awaiting_confirmation = False
         awaiting_pick = False
         pick_options = []
+
+    def add_or_increment_pending(food, is_search=False):
+        """Add a pending food once; duplicates increase servings instead."""
+        nonlocal pending_foods, pending_searched_foods, pending_item_quantities
+
+        target = pending_searched_foods if is_search else pending_foods
+
+        def same_item(a, b):
+            if is_search:
+                a_id = a.get("original_id") or a.get("external_id") or a.get("name", "").lower()
+                b_id = b.get("original_id") or b.get("external_id") or b.get("name", "").lower()
+                return str(a_id) == str(b_id)
+            return str(a.get("food_id", "")) == str(b.get("food_id", ""))
+
+        existing = next((x for x in target if same_item(x, food)), None)
+        if existing is None:
+            target.append(food)
+            return
+
+        name = existing.get("name", food.get("name", ""))
+        base_qty = _num_or_none(existing.get("quantity")) or 1.0
+        current_qty = _num_or_none(pending_item_quantities.get(name))
+        if current_qty is None:
+            current_qty = base_qty
+        increment = _num_or_none(food.get("quantity")) or 1.0
+        pending_item_quantities[name] = round(current_qty + increment, 3)
 
     def process_next_disambiguation():
         """Pop the next ambiguous item and ask the user to pick."""
@@ -1037,7 +1119,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
 
         # Searched/unfamiliar foods — ask about quantity
         count = len(pending_foods) + len(pending_searched_foods)
-        print(f"\n  Assistant: Found {count} item(s) for {meal_name}. How much? (e.g. '1 katori', '1 plate', or 'yes' for 1 serving)\n")
+        print(f"\n  Assistant: Found {count} item(s) for {meal_name}. How many servings? (e.g. '1.5 servings', '2', or 'yes' for 1 serving)\n")
         awaiting_confirmation = True
 
     def commit_pending_logs():
@@ -1047,14 +1129,26 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
         logged_names = []
         failed_names = []
 
-        def quantity_for_food(food_name):
+        # Check if user explicitly set a quantity (not the default "1")
+        user_set_quantity = (pending_quantity != "1" or bool(pending_item_quantities))
+
+        def quantity_for_food(food_name, default_qty=None):
+            """Get quantity for a food. If user didn't set one, use MFP default."""
             for k, v in pending_item_quantities.items():
                 if k.lower() in food_name.lower() or food_name.lower() in k.lower():
                     return float(v)
-            try:
-                return float(pending_quantity)
-            except (ValueError, TypeError):
-                return 1.0
+            if user_set_quantity:
+                try:
+                    return float(pending_quantity)
+                except (ValueError, TypeError):
+                    return 1.0
+            # Use the food's own default quantity from MFP recents
+            if default_qty is not None:
+                try:
+                    return float(default_qty)
+                except (ValueError, TypeError):
+                    pass
+            return 1.0
 
         if pending_foods:
             # Apply quantity override to the all_foods list entries that match selected foods
@@ -1064,18 +1158,19 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
                     if f["food_id"] in selected_ids:
                         matched = next((x for x in pending_foods if x["food_id"] == f["food_id"]), None)
                         if matched:
-                            f["quantity"] = str(quantity_for_food(matched["name"]))
+                            q = quantity_for_food(matched["name"], default_qty=matched.get("quantity"))
+                            f["quantity"] = str(q)
             recent_success = log_foods(session, pending_foods, pending_all_foods, pending_meal_idx, pending_metadata)
             if recent_success:
                 for f in pending_foods:
-                    q = quantity_for_food(f["name"])
+                    q = quantity_for_food(f["name"], default_qty=f.get("quantity"))
                     qty_display = f" (x{q:g})" if q != 1 else ""
                     logged_names.append(f["name"] + qty_display)
             else:
                 failed_names.extend([f["name"] for f in pending_foods])
 
         for food in pending_searched_foods:
-            q = quantity_for_food(food["name"])
+            q = quantity_for_food(food["name"], default_qty=food.get("quantity"))
             if log_searched_food(session, food, pending_meal_idx, pending_search_metadata, quantity=str(q)):
                 searched_success_count += 1
                 qty_display = f" (x{q:g})" if q != 1 else ""
@@ -1121,7 +1216,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
                 if len(matches) == 1:
                     candidate = all_foods[matches[0]]
                     if has_reasonable_recent_overlap(desc, [candidate["name"]]):
-                        pending_foods.append(candidate)
+                        add_or_increment_pending(candidate, is_search=False)
                     else:
                         not_found.append(desc)
                 elif len(matches) > 1:
@@ -1144,33 +1239,65 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
             not_found.extend(split_food_descriptions(food_desc))
 
         # Search fallback for items not in recents
+        search_cache = {}  # query -> (search_results, search_meta)
         still_not_found = []
         for desc in not_found:
             parts = split_compound_food_for_search(desc)
+            # Preserve counts but avoid repeated searches for duplicate parts.
+            part_counts = {}
+            unique_parts = []
+            for p in parts:
+                key = normalize_food_query(p).lower()
+                part_counts[key] = part_counts.get(key, 0) + 1
+                if part_counts[key] == 1:
+                    unique_parts.append(p)
             unresolved_parts = []
             if len(parts) > 1:
-                print(f"  Assistant: Splitting \"{desc}\" into: {', '.join(parts)}")
+                display_parts = []
+                for p in unique_parts:
+                    key = normalize_food_query(p).lower()
+                    count = part_counts.get(key, 1)
+                    display_parts.append(f"{p} x{count}" if count > 1 else p)
+                print(f"  Assistant: Splitting \"{desc}\" into: {', '.join(display_parts)}")
 
-            for part in parts:
+            for part in unique_parts:
                 search_query = normalize_food_query(part)
-                print(f"  Assistant: Searching MFP for \"{search_query}\"...")
-                search_results, search_meta = search_foods(session, search_query, meal_idx)
+                part_key = search_query.lower()
+                multiplier = part_counts.get(part_key, 1)
+                if search_query in search_cache:
+                    search_results, search_meta = search_cache[search_query]
+                else:
+                    count_note = f" (x{multiplier})" if multiplier > 1 else ""
+                    print(f"  Assistant: Searching MFP for \"{search_query}\"{count_note}...")
+                    search_results, search_meta = search_foods(session, search_query, meal_idx)
+                    search_cache[search_query] = (search_results, search_meta)
                 if search_meta and not pending_search_metadata:
                     pending_search_metadata = search_meta
                 if search_results:
+                    meal_bundle = pick_meal_bundle_results(search_query, search_results)
+                    if meal_bundle:
+                        print(f"  Assistant: Found meal \"{search_query}\" with {len(meal_bundle)} item(s):")
+                        for m in meal_bundle:
+                            print(f"    - {m['name']}")
+                            for _ in range(multiplier):
+                                add_or_increment_pending(m, is_search=True)
+                        continue
+
                     best_match, confidence = match_search_results_with_gpt(search_query, search_results)
                     if best_match and confidence in ("high", "medium"):
                         print(f"  Assistant: Found: {best_match['name']}")
-                        pending_searched_foods.append(best_match)
+                        for _ in range(multiplier):
+                            add_or_increment_pending(best_match, is_search=True)
                     else:
                         fallback = pick_reasonable_search_result(search_query, search_results)
                         if fallback:
                             print(f"  Assistant: Found likely match: {fallback['name']}")
-                            pending_searched_foods.append(fallback)
+                            for _ in range(multiplier):
+                                add_or_increment_pending(fallback, is_search=True)
                         else:
-                            unresolved_parts.append(part)
+                            unresolved_parts.extend([part] * multiplier)
                 else:
-                    unresolved_parts.append(part)
+                    unresolved_parts.extend([part] * multiplier)
 
             still_not_found.extend(unresolved_parts)
         not_found = still_not_found
@@ -1199,50 +1326,89 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
                                "sounds good", "alright thanks", "all right thanks",
                                "all right sounds good", "thanks that's it", "thank you",
                                "thanks bye", "ok thanks", "ok bye", "okay bye",
-                               "perfect thanks", "cool thanks", "great thanks", "appreciate it"]
+                               "perfect thanks", "cool thanks", "great thanks", "appreciate it",
+                               "thats it", "thats all", "im done"]
             import string
-            clean_input = lower_input_check.translate(str.maketrans("", "", string.punctuation))
+            trans = str.maketrans("", "", string.punctuation)
+            clean_input = lower_input_check.translate(trans)
             is_goodbye = (lower_input_check in goodbye_keywords or
-                          any(phrase in clean_input for phrase in goodbye_phrases))
+                          any(phrase.translate(trans) in clean_input for phrase in goodbye_phrases))
             if is_goodbye:
-                if always_on:
-                    # Don't exit — go back to passive wake word listening
-                    print("\n  Assistant: Talk to you later! Say 'Hey Claude' when you need me.\n")
-                    reset_state()
-                    continue
-                else:
-                    print("\n  Assistant: Talk to you later!\n")
-                    break
+                print("\n  Assistant: Talk to you later!\n")
+                break
 
             # ── Picking from disambiguation options ──
             if awaiting_pick:
-                try:
-                    choice = int(user_input.strip()) - 1
-                    if 0 <= choice < len(pick_options):
-                        chosen = pick_options[choice]
-                        pending_foods.append(chosen)
-                        awaiting_pick = False
-                        print(f"\n  Assistant: Got it — {chosen['name']}.")
-                        process_next_disambiguation()
-                        continue
-                    else:
-                        print(f"\n  Assistant: Pick a number between 1 and {len(pick_options)}.\n")
-                        continue
-                except ValueError:
+                choice = None
+                raw_pick = user_input.strip().lower()
+
+                # Numeric input: "1", "2", ...
+                if re.fullmatch(r"\d+", raw_pick):
+                    choice = int(raw_pick) - 1
+                else:
+                    # Natural language: "first one", "option 2", "the last one"
+                    clean_pick = re.sub(r"[^a-z0-9\s#]", " ", raw_pick)
+                    clean_pick = re.sub(r"\s+", " ", clean_pick).strip()
+
+                    ord_map = {
+                        "first": 0,
+                        "second": 1,
+                        "third": 2,
+                        "fourth": 3,
+                        "fifth": 4,
+                    }
+                    for word, idx in ord_map.items():
+                        if re.search(rf"\b{word}\b", clean_pick):
+                            choice = idx
+                            break
+
+                    if choice is None and re.search(r"\blast\b", clean_pick):
+                        choice = len(pick_options) - 1
+
+                    if choice is None:
+                        m = re.search(r"(?:option|number|#)?\s*(\d+)", clean_pick)
+                        if m:
+                            choice = int(m.group(1)) - 1
+
+                if choice is not None and 0 <= choice < len(pick_options):
+                    chosen = pick_options[choice]
+                    add_or_increment_pending(chosen, is_search=False)
                     awaiting_pick = False
-                    pick_options = []
-                    # Fall through to re-parse
+                    print(f"\n  Assistant: Got it — {chosen['name']}.")
+                    process_next_disambiguation()
+                    continue
+
+                print(f"\n  Assistant: I didn't catch the pick. Say 1-{len(pick_options)} or \"first one\".\n")
+                continue
 
             # ── Confirmation flow ──
             if awaiting_confirmation:
+                pending_names_for_parse = [f["name"] for f in pending_foods] + [f["name"] for f in pending_searched_foods]
+
+                # Prefer per-food parsing first for multi-item inputs.
+                per_food_qty = parse_per_food_quantities_with_gpt(user_input, pending_names_for_parse)
+                if per_food_qty:
+                    pending_item_quantities = per_food_qty
+                    print(f"\n  Assistant: Got it — logging: {user_input.strip()}.")
+                    print("  Assistant: Go ahead? (yes/no)\n")
+                    continue
+
                 # Fast path: household quantity expressions (katori/plate/bowl).
-                qty_parse = parse_household_quantity_to_servings(user_input)
+                lower_qty_input = user_input.lower()
+                mentions_multiple_items = ("," in lower_qty_input or " and " in lower_qty_input)
+                mentions_food_name = any(
+                    any(tok in lower_qty_input for tok in _tokenize_food_text(name))
+                    for name in pending_names_for_parse
+                )
+                simple_household_input = not (mentions_multiple_items or mentions_food_name)
+
+                qty_parse = parse_household_quantity_to_servings(user_input) if simple_household_input else None
                 if qty_parse:
                     servings, unit, amount, base = qty_parse
                     pending_quantity = str(servings)
                     print(
                         f"\n  Assistant: Got it — {amount:g} {unit} "
-                        f"(~{base:g} serving each) => {servings:g} serving(s)."
+                        f"(~{base:g} serving each) => {servings:g} servings."
                     )
                     print("  Assistant: Go ahead? (yes/no)\n")
                     continue
@@ -1400,15 +1566,6 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
                         print("  Assistant: Yes to log, no to cancel.\n")
                     continue
 
-                # Per-food quantity instruction (e.g. "1 serving channay and 1/2 serving rice")
-                per_food_qty = parse_per_food_quantities_with_gpt(user_input, pending_names)
-                if per_food_qty:
-                    pending_item_quantities = per_food_qty
-                    pairs = ", ".join([f"{k}: {v:g} serving(s)" for k, v in per_food_qty.items()])
-                    print(f"\n  Assistant: Got it — {pairs}.")
-                    print("  Assistant: Go ahead? (yes/no)\n")
-                    continue
-
                 # Single GPT call to understand what the user wants
                 confirm_resp = client.chat.completions.create(
                     model="gpt-4o-mini",
@@ -1518,7 +1675,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
                             if ci:
                                 cal_info = f" (base: {ci})"
                         qty_display = int(qty) if qty == int(qty) else qty
-                        print(f"\n  Assistant: Got it — logging {qty_display} serving(s) of {food_name}{cal_info}.")
+                        print(f"\n  Assistant: Got it — logging {qty_display} servings of {food_name}{cal_info}.")
                         print(f"  Assistant: Go ahead? (yes/no)\n")
                     else:
                         print(f"\n  Assistant: Didn't catch that — how many servings?\n")
@@ -1648,6 +1805,19 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
             preset_name = parsed.get("preset_name")
             sub_action = parsed.get("sub_action")
 
+            # Guardrail: requests about "option menu" are usually about the
+            # recent-food disambiguation list, not meal presets.
+            option_words = ("option", "menu", "first one", "second one", "third one")
+            if (intent == "manage_meal" and not preset_name and
+                    any(w in lower_input_check for w in option_words)):
+                print(
+                    "\n  Assistant: I can't edit that option menu directly. "
+                    "It's pulled from your MyFitnessPal recents. "
+                    "Tell me the exact food to remove from your diary, like "
+                    "\"remove Premier protein bar from breakfast.\"\n"
+                )
+                continue
+
             # Guardrail: GPT can misclassify "add X to lunch/dinner" as preset management.
             # If no preset name is provided, treat meal+food phrasing as normal diary logging.
             if intent in ("manage_meal", "log_meal") and not preset_name:
@@ -1656,6 +1826,22 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
                         intent = "remove"
                     else:
                         intent = "log"
+
+            # Guardrail: "can we log lunch?" can be misclassified as defer.
+            # If user asks to log but didn't provide foods yet, prompt for foods.
+            if intent == "defer":
+                defer_markers = (
+                    "later", "not yet", "remind me", "check back", "haven't eaten",
+                    "havent eaten", "in an hour", "after", "postpone", "defer",
+                )
+                asks_to_log = any(k in lower_input_check for k in ("log", "add", "track"))
+                is_true_defer = any(k in lower_input_check for k in defer_markers)
+                if asks_to_log and not is_true_defer:
+                    if mentioned_meal:
+                        print(f"\n  Assistant: Sure — what should we log for {mentioned_meal}?\n")
+                    else:
+                        print("\n  Assistant: Sure — what should we log?\n")
+                    continue
 
             # ── Skip intent ──
             if intent == "skip":
@@ -1836,6 +2022,20 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
                 matched_name, preset = get_preset(preset_name) if preset_name else (None, None)
 
                 if not matched_name:
+                    # If user says "... meal ..." but it's not one of our local presets,
+                    # treat it as an MFP meal search phrase instead of hard-failing.
+                    fallback_phrase = (food_desc or preset_name or "").strip()
+                    if fallback_phrase and "meal" in lower_input_check:
+                        unlogged = get_unlogged_meals(session)
+                        if mentioned_meal:
+                            meal_idx = resolve_meal_idx(mentioned_meal, unlogged)
+                        elif last_meal_idx is not None:
+                            meal_idx = last_meal_idx
+                        else:
+                            meal_idx = resolve_meal_idx(None, unlogged)
+                        start_food_matching(fallback_phrase, meal_idx)
+                        continue
+
                     names = get_preset_names()
                     if names:
                         print(f"\n  Assistant: I don't have a preset called \"{preset_name}\".")
@@ -2049,6 +2249,12 @@ def main():
     parser.add_argument("--voice", action="store_true", help="Speak Assistant messages through local speakers")
     parser.add_argument("--voice-name", type=str, default=None, help="Optional TTS voice name (e.g. 'Samantha')")
     parser.add_argument(
+        "--voice-volume",
+        type=int,
+        default=int(os.getenv("VOICE_VOLUME", "65")),
+        help="Assistant speech volume 0-100 (default 65)",
+    )
+    parser.add_argument(
         "--reminder-times",
         type=str,
         default=os.getenv("REMINDER_TIMES", "09:30,13:30,19:30"),
@@ -2058,18 +2264,10 @@ def main():
     parser.add_argument(
         "--summary-time",
         type=str,
-        default=os.getenv("SUMMARY_TIME", "23:49"),
-        help="HH:MM time to text daily diet summary (default 23:49)",
+        default=os.getenv("SUMMARY_TIME", "23:00"),
+        help="HH:MM time to text daily diet summary (default 23:00)",
     )
     parser.add_argument("--no-summary", action="store_true", help="Disable nightly summary text")
-    parser.add_argument("--voice-input", action="store_true",
-                        help="Enable microphone input with local Whisper STT (implies --voice)")
-    parser.add_argument("--always-on", action="store_true",
-                        help="Always-on mode — listens for wake word, then processes command (implies --voice)")
-    parser.add_argument("--wake-phrase", type=str, default="hey claude",
-                        help="Wake phrase for always-on mode (default: 'hey claude')")
-    parser.add_argument("--whisper-model", type=str, default="base",
-                        help="Whisper model size: tiny, base, small, medium (default: base)")
     parser.add_argument("--test-sms", action="store_true", help="Send a test SMS and exit (to verify Twilio config)")
     args = parser.parse_args()
 
@@ -2094,39 +2292,25 @@ def main():
         print("Add it like: OPENAI_API_KEY=sk-...")
         sys.exit(1)
 
-    # Always-on implies voice-input implies voice
-    if args.always_on:
-        args.voice_input = True
-    if args.voice_input:
-        args.voice = True
-
-    speaker = Speaker(enabled=args.voice, voice_name=args.voice_name)
-    original_stdout = sys.stdout
-    uses_mic = args.voice_input or args.always_on
-    if speaker.enabled:
-        sys.stdout = AssistantSpeechInterceptor(
-            sys.stdout, speaker, blocking=uses_mic
-        )
-
-    # Build input provider
-    io_lock = threading.Lock() if uses_mic else None
-    if args.always_on:
-        from voice_io import AlwaysOnInputProvider
-        input_provider = AlwaysOnInputProvider(
-            whisper_model=args.whisper_model,
-            wake_phrase=args.wake_phrase,
-            io_lock=io_lock,
-            speaker=speaker,
-        )
-    elif args.voice_input:
-        from voice_io import VoiceInputProvider
-        input_provider = VoiceInputProvider(
-            whisper_model=args.whisper_model,
-            io_lock=io_lock,
-        )
-    else:
+    # Hybrid input: type OR hold Option key to speak
+    try:
+        from voice_io import HybridInputProvider
+        input_provider = HybridInputProvider()
+    except (ImportError, OSError):
+        # Fallback to text-only if pynput/whisper not installed
         from voice_io import TextInputProvider
         input_provider = TextInputProvider()
+    io_lock = None
+
+    # Speaker: always enabled at low volume for voice responses only.
+    # When input comes from Option key, the interceptor speaks the response.
+    # When input is typed, it stays silent.
+    voice_volume = max(0, min(100, int(args.voice_volume)))
+    speaker = Speaker(enabled=True, voice_name=args.voice_name, default_volume=voice_volume)
+    original_stdout = sys.stdout
+    sys.stdout = AssistantSpeechInterceptor(
+        sys.stdout, speaker, input_provider=input_provider
+    )
 
     reminder_times = [] if args.no_reminders else parse_reminder_times(args.reminder_times)
     if reminder_times:
@@ -2146,8 +2330,7 @@ def main():
         )
     finally:
         input_provider.cleanup()
-        if speaker.enabled:
-            sys.stdout = original_stdout
+        sys.stdout = original_stdout
 
 
 if __name__ == "__main__":

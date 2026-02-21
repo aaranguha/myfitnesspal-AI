@@ -6,6 +6,8 @@ input from keyboard, microphone, or (future) Alexa without changes.
 """
 
 import re
+import select
+import sys
 import time
 from abc import ABC, abstractmethod
 
@@ -29,6 +31,7 @@ FOOD_CONTEXT_PROMPT = (
 def record_until_silence(
     stream, vad, sample_rate, frame_size,
     voice_start_threshold=3, silence_threshold=30, max_duration=30.0,
+    max_idle_sec=None,
 ):
     """Record audio from an open stream until silence is detected.
 
@@ -39,6 +42,7 @@ def record_until_silence(
     silent_count = 0
     recording = False
     start_time = None
+    idle_start = time.time()
 
     while True:
         frame_data, _ = stream.read(frame_size)
@@ -46,6 +50,8 @@ def record_until_silence(
         is_speech = vad.is_speech(frame_bytes, sample_rate)
 
         if not recording:
+            if max_idle_sec is not None and (time.time() - idle_start) >= max_idle_sec:
+                break
             if is_speech:
                 voiced_count += 1
                 if voiced_count >= voice_start_threshold:
@@ -108,6 +114,154 @@ class TextInputProvider(InputProvider):
         return input(prompt).strip()
 
 
+class HybridInputProvider(InputProvider):
+    """Type OR hold Option key to speak — whichever comes first.
+
+    Runs a pynput listener in the background. While waiting for typed input,
+    if the user holds Option, it records audio, transcribes, and returns text.
+    """
+
+    def __init__(self, whisper_model: str = "base"):
+        import threading
+        from pynput import keyboard as kb
+
+        self._result_ready = threading.Event()
+        self._voice_text = None
+        self._recording = False
+        self._audio_buffer = []
+        self._stream = None
+        self._lock = threading.Lock()
+        self.last_was_voice = False  # True when last input came from Option key
+
+        print(f"  [hybrid] Loading Whisper '{whisper_model}' model...")
+        self.model = WhisperModel(whisper_model, device="cpu", compute_type="int8")
+        print(f"  [hybrid] Ready. Type or hold Option key to speak.")
+
+        self.sample_rate = 16000
+        self.blocksize = 1024
+
+        # Start pynput listener in background
+        self._listener = kb.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release,
+        )
+        self._listener.daemon = True
+        self._listener.start()
+
+    def _on_press(self, key):
+        from pynput import keyboard as kb
+        if key in (kb.Key.alt, kb.Key.alt_l, kb.Key.alt_r):
+            self._start_recording()
+
+    def _on_release(self, key):
+        from pynput import keyboard as kb
+        if key in (kb.Key.alt, kb.Key.alt_l, kb.Key.alt_r):
+            self._stop_recording()
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        if self._recording:
+            self._audio_buffer.append(indata.copy())
+
+    def _start_recording(self):
+        with self._lock:
+            if self._recording:
+                return
+            self._recording = True
+            self._audio_buffer = []
+
+        print("\n  [recording...] ", end="", flush=True)
+
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=self.blocksize,
+            callback=self._audio_callback,
+        )
+        self._stream.start()
+
+    def _stop_recording(self):
+        with self._lock:
+            if not self._recording:
+                return
+            self._recording = False
+            buffer = list(self._audio_buffer)
+
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+        if not buffer:
+            print("\r                          ", end="\r", flush=True)
+            return
+
+        audio_np = np.concatenate(buffer, axis=0)
+        raw_audio = audio_np.tobytes()
+        duration = len(raw_audio) / (self.sample_rate * 2)
+
+        if duration < 0.3:
+            print("\r  (too short)             ", end="\r", flush=True)
+            return
+
+        print(f"\r  [transcribing...]       ", end="", flush=True)
+
+        text = transcribe_audio(
+            self.model, raw_audio, self.sample_rate,
+            initial_prompt=FOOD_CONTEXT_PROMPT,
+        )
+
+        if text and len(text.strip()) >= 2:
+            print(f"\r                          ", end="\r", flush=True)
+            self._voice_text = text.strip()
+            self._result_ready.set()
+        else:
+            print(f"\r  (couldn't transcribe)   ", end="\r", flush=True)
+
+    def get_input(self, prompt: str = "") -> str:
+        """Block until user types or speaks via Option key."""
+        import threading
+
+        self._result_ready.clear()
+        self._voice_text = None
+
+        # Read keyboard in a background thread so we can also wait for voice
+        typed_text = [None]
+
+        def read_stdin():
+            try:
+                text = input(prompt).strip()
+                typed_text[0] = text
+                self._result_ready.set()
+            except (EOFError, KeyboardInterrupt):
+                typed_text[0] = ""
+                self._result_ready.set()
+
+        t = threading.Thread(target=read_stdin, daemon=True)
+        t.start()
+
+        # Wait for either voice or keyboard
+        self._result_ready.wait()
+
+        if self._voice_text:
+            result = self._voice_text
+            self._voice_text = None
+            self.last_was_voice = True
+            # Print what was said so it appears in the conversation
+            print(f"{prompt}{result}")
+            return result
+
+        self.last_was_voice = False
+        return typed_text[0] or ""
+
+    def cleanup(self):
+        if hasattr(self, '_listener'):
+            self._listener.stop()
+        # Suppress the stdin lock error on exit
+        import os
+        os._exit(0)
+
+
 class VoiceInputProvider(InputProvider):
     """Microphone input with faster-whisper STT.
 
@@ -156,6 +310,7 @@ class VoiceInputProvider(InputProvider):
             raw_audio, did_record = record_until_silence(
                 stream, self.vad, self.sample_rate, self.frame_size,
                 self.voice_start_threshold, self.silence_threshold, self.max_duration,
+                max_idle_sec=0.8,
             )
 
         if not did_record:
@@ -248,9 +403,11 @@ class AlwaysOnInputProvider(InputProvider):
             "all right thanks", "all right sounds good", "thanks that's it",
             "thank you", "thanks bye", "ok thanks", "ok bye", "okay bye",
             "perfect thanks", "cool thanks", "great thanks", "appreciate it",
+            "thats it", "thats all", "im done",
         ]
 
         print(f"  [always-on] Ready. Say '{wake_phrase}' to activate.")
+        print("  [always-on] You can also type and press Enter at any time.")
 
     def open_reminder_response_window(self, seconds=15):
         """Called by reminder thread — temporarily accept any speech for N seconds."""
@@ -259,10 +416,10 @@ class AlwaysOnInputProvider(InputProvider):
     def _is_goodbye(self, text: str) -> bool:
         """Check if the text is a goodbye/end-conversation phrase."""
         import string
-        # Strip punctuation so "Alright, thanks." matches "alright thanks"
-        lower = text.lower().strip()
-        clean = lower.translate(str.maketrans("", "", string.punctuation))
-        return any(phrase in clean for phrase in self._goodbye_phrases)
+        # Strip punctuation from both input and phrases so "that's it" matches "thats it"
+        trans = str.maketrans("", "", string.punctuation)
+        clean = text.lower().strip().translate(trans)
+        return any(phrase.translate(trans) in clean for phrase in self._goodbye_phrases)
 
     def _check_wake_word(self, text: str):
         """Check if text starts with the wake phrase.
@@ -278,6 +435,22 @@ class AlwaysOnInputProvider(InputProvider):
                 return command
         return None
 
+    def _poll_typed_input(self):
+        """Return a typed line if available, otherwise None (non-blocking)."""
+        try:
+            if not sys.stdin or not sys.stdin.isatty():
+                return None
+            ready, _, _ = select.select([sys.stdin], [], [], 0)
+            if not ready:
+                return None
+            line = sys.stdin.readline()
+            if not line:
+                return None
+            text = line.strip()
+            return text or None
+        except Exception:
+            return None
+
     def get_input(self, prompt: str = "") -> str:
         """Block until input is ready.
 
@@ -285,6 +458,11 @@ class AlwaysOnInputProvider(InputProvider):
         If passive: wait for wake word, then activate conversation.
         """
         while True:
+            typed = self._poll_typed_input()
+            if typed:
+                print(f"{prompt}{typed}")
+                return typed
+
             if self.io_lock:
                 self.io_lock.acquire()
             try:
@@ -309,6 +487,7 @@ class AlwaysOnInputProvider(InputProvider):
             raw_audio, did_record = record_until_silence(
                 stream, self.vad, self.sample_rate, self.frame_size,
                 self.voice_start_threshold, self.silence_threshold, self.max_duration,
+                max_idle_sec=0.8,
             )
 
         if not did_record:

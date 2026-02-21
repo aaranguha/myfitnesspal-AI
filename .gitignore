@@ -12,3 +12,7 @@ chromedriver.log
 *.pyc
 .DS_Store
 release/
+alexa_lambda/package/
+alexa_lambda/lambda_deployment.zip
+alexa_lambda/cookie.txt
+com.dietassistant.hotkey.plist

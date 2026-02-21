@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""
+Push-to-talk Diet Assistant — hold Option key, speak, release.
+
+Runs as a background process. Hold the Option (Alt) key to record,
+release to process. Uses the same GPT parsing + MFP logging as the
+terminal assistant.
+
+Usage:
+    python hotkey_assistant.py
+    python hotkey_assistant.py --whisper-model small
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+import threading
+import time
+from datetime import date, datetime
+
+import numpy as np
+import sounddevice as sd
+from dotenv import load_dotenv
+from pynput import keyboard
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
+
+# Import voice helpers
+from voice_io import FOOD_CONTEXT_PROMPT, transcribe_audio
+
+# Import assistant logic
+from assistant import (
+    MEALS,
+    MEAL_NAMES_TO_IDX,
+    build_diary_context,
+    create_session,
+    get_diary_details,
+    get_recent_foods_cached,
+    get_unlogged_meals,
+    guess_meal_from_time,
+    has_reasonable_recent_overlap,
+    invalidate_recents_cache,
+    log_foods,
+    log_searched_food,
+    match_foods_with_gpt,
+    match_search_results_with_gpt,
+    normalize_food_query,
+    parse_user_message,
+    pick_meal_bundle_results,
+    pick_reasonable_search_result,
+    quick_add_food,
+    remove_food,
+    resolve_meal_idx,
+    search_foods,
+    smart_reply,
+    split_compound_food_for_search,
+    split_food_descriptions,
+)
+
+from myfitnesspal import check_meals_logged, send_sms, send_sms_to, build_daily_summary
+
+USER_NAME = os.getenv("USER_NAME", "Aaran")
+
+# Default reminder/summary config (can override via env or CLI args)
+DEFAULT_REMINDER_TIMES = os.getenv("REMINDER_TIMES", "09:30,13:30,19:30")
+DEFAULT_SUMMARY_TIME = os.getenv("SUMMARY_TIME", "23:00")
+SUMMARY_SENT_FILE = os.path.join(SCRIPT_DIR, ".summary_sent")
+
+# ── Audio config ─────────────────────────────────────────────────────────
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+DTYPE = "int16"
+BLOCKSIZE = 1024  # frames per read
+
+
+# ── TTS ──────────────────────────────────────────────────────────────────
+
+def speak(text):
+    """Speak text using macOS say command (non-blocking)."""
+    if not text:
+        return
+    try:
+        subprocess.Popen(["say", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+# ── Single-turn food logging ─────────────────────────────────────────────
+
+def process_log(session, food_desc, meal_idx):
+    """Log foods in a single turn — auto-resolve disambiguation."""
+    meal_name = MEALS[meal_idx]["name"]
+    print(f"  Checking {meal_name} recents...")
+
+    all_foods, metadata = get_recent_foods_cached(session, meal_idx)
+
+    logged_names = []
+    pending_foods = []        # from recents
+    pending_searched = []     # from MFP search
+    search_metadata = None
+
+    # Step 1: Match against recents
+    if all_foods:
+        match_results = match_foods_with_gpt(food_desc, all_foods)
+        not_found_descs = []
+
+        for item in match_results:
+            matches = item.get("matches", [])
+            desc = item.get("description", "")
+
+            if len(matches) >= 1:
+                # Auto-pick first match (no disambiguation in push-to-talk)
+                candidate = all_foods[matches[0]]
+                if has_reasonable_recent_overlap(desc, [candidate["name"]]):
+                    pending_foods.append(candidate)
+                else:
+                    not_found_descs.append(desc)
+            else:
+                not_found_descs.append(desc)
+
+        if not match_results:
+            not_found_descs = split_food_descriptions(food_desc)
+    else:
+        not_found_descs = split_food_descriptions(food_desc)
+
+    # Step 2: Search MFP for anything not in recents
+    for desc in not_found_descs:
+        parts = split_compound_food_for_search(desc)
+        for part in parts:
+            query = normalize_food_query(part)
+            print(f"  Searching MFP for \"{query}\"...")
+            results, s_meta = search_foods(session, query, meal_idx)
+            if s_meta and not search_metadata:
+                search_metadata = s_meta
+            if results:
+                bundle = pick_meal_bundle_results(query, results)
+                if bundle:
+                    for m in bundle:
+                        pending_searched.append(m)
+                    continue
+                best, confidence = match_search_results_with_gpt(query, results)
+                if best and confidence in ("high", "medium"):
+                    pending_searched.append(best)
+                else:
+                    fallback = pick_reasonable_search_result(query, results)
+                    if fallback:
+                        pending_searched.append(fallback)
+
+    # Step 3: Log everything
+    if pending_foods:
+        if log_foods(session, pending_foods, all_foods, meal_idx, metadata):
+            logged_names.extend(f["name"] for f in pending_foods)
+
+    for food in pending_searched:
+        if log_searched_food(session, food, meal_idx, search_metadata):
+            logged_names.append(food["name"])
+
+    if logged_names:
+        invalidate_recents_cache(meal_idx)
+
+    return logged_names
+
+
+def process_remove(session, food_desc, mentioned_meal):
+    """Remove food(s) from diary in a single turn."""
+    from datetime import date
+    import json
+    from openai import OpenAI
+
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    diary, _ = get_diary_details(session, date.today())
+
+    candidates = []
+    if mentioned_meal and mentioned_meal in MEAL_NAMES_TO_IDX:
+        target_idx = MEAL_NAMES_TO_IDX[mentioned_meal]
+        for f in diary.get(target_idx, []):
+            f["meal_idx"] = target_idx
+            candidates.append(f)
+    else:
+        for midx, foods in diary.items():
+            for f in foods:
+                f["meal_idx"] = midx
+                candidates.append(f)
+
+    if not candidates:
+        return None, "Nothing logged to remove."
+
+    if not food_desc or food_desc.lower() in ("everything", "all"):
+        removed = 0
+        for f in candidates:
+            if f.get("entry_id") and remove_food(session, f["entry_id"]):
+                removed += 1
+        if removed:
+            invalidate_recents_cache()
+        return removed, f"Removed {removed} item(s)."
+
+    # GPT match
+    food_names_list = [f"{i}: {f['name']}" for i, f in enumerate(candidates)]
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "The user wants to REMOVE food from their diary. "
+                    "Match what they said to the numbered list of logged foods. "
+                    "Return ONLY a JSON array of matching index numbers, e.g. [0, 2]. "
+                    "Match loosely. Return [] if no match."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Remove: {food_desc}\n\nLogged foods:\n" + "\n".join(food_names_list),
+            },
+        ],
+    )
+    raw = response.choices[0].message.content.strip()
+    try:
+        indices = json.loads(raw)
+        to_remove = [candidates[i] for i in indices if isinstance(i, int) and 0 <= i < len(candidates)]
+    except Exception:
+        to_remove = []
+
+    if not to_remove:
+        return 0, f"Couldn't find \"{food_desc}\" in your logged foods."
+
+    removed = 0
+    names = []
+    for f in to_remove:
+        if f.get("entry_id") and remove_food(session, f["entry_id"]):
+            removed += 1
+            names.append(f["name"])
+    if removed:
+        invalidate_recents_cache()
+    return removed, f"Removed {', '.join(names)}."
+
+
+def process_command(session, text):
+    """Process a single voice command. Returns response string."""
+    print(f"\n  You: {text}")
+
+    parsed = parse_user_message(text)
+    intent = parsed.get("intent", "chat")
+    food_desc = parsed.get("foods")
+    mentioned_meal = parsed.get("meal")
+
+    # ── Quick add ──
+    if intent == "quick_add":
+        calories = parsed.get("calories", 0) or 0
+        protein = parsed.get("protein", 0) or 0
+        fat = parsed.get("fat", 0) or 0
+        carbs = parsed.get("carbs", 0) or 0
+        description = food_desc or "Quick Add"
+
+        unlogged = get_unlogged_meals(session)
+        meal_idx = resolve_meal_idx(mentioned_meal, unlogged)
+        meal_name = MEALS[meal_idx]["name"]
+
+        if quick_add_food(session, meal_idx, description, calories, protein, carbs, fat):
+            return f"Quick added {description} to {meal_name}. {calories} calories."
+        return "Something went wrong with the quick add."
+
+    # ── Remove ──
+    if intent == "remove":
+        _, msg = process_remove(session, food_desc, mentioned_meal)
+        return msg
+
+    # ── Log ──
+    if intent == "log" and food_desc:
+        unlogged = get_unlogged_meals(session)
+        meal_idx = resolve_meal_idx(mentioned_meal, unlogged)
+        meal_name = MEALS[meal_idx]["name"]
+
+        logged = process_log(session, food_desc, meal_idx)
+        if logged:
+            names = ", ".join(logged)
+            return f"Got it, logged {names} to {meal_name}."
+        return f"Couldn't find a match for {food_desc}."
+
+    # ── Text summary on demand (only to user's number) ──
+    text_lower = text.lower()
+    if any(kw in text_lower for kw in ("text me", "send me", "text my")) and \
+       any(kw in text_lower for kw in ("summary", "macros", "calories", "protein", "progress")):
+        msg = build_daily_summary(session)
+        if msg:
+            my_number = os.getenv("MY_PHONE_NUMBER", "+15109469095")
+            ok = send_sms_to(msg, my_number)
+            if ok:
+                return "Done, just texted you your summary."
+            return "Couldn't send the text. Check your config."
+        return "No diary data to summarize yet today."
+
+    # ── Chat / questions ──
+    if intent == "chat":
+        context = build_diary_context(session)
+        return smart_reply(text, context)
+
+    # ── Skip ──
+    if intent == "skip":
+        return "OK, noted."
+
+    # ── Defer ──
+    if intent == "defer":
+        return "Got it, I'll leave it for now."
+
+    return "I didn't catch that. Try again?"
+
+
+# ── Reminders ────────────────────────────────────────────────────────────
+
+def parse_reminder_times(raw):
+    """Parse comma-separated HH:MM values."""
+    if not raw:
+        return []
+    parsed = []
+    for token in raw.split(","):
+        t = token.strip()
+        if not t:
+            continue
+        try:
+            datetime.strptime(t, "%H:%M")
+            parsed.append(t)
+        except ValueError:
+            print(f"Skipping invalid reminder time: {t} (expected HH:MM)")
+    return sorted(set(parsed))
+
+
+def start_reminder_loop(session, reminder_times, stop_event):
+    """Background reminders — speaks when meals are unlogged at scheduled times.
+
+    reminder_times[0] → Breakfast, [1] → Lunch, [2] → Dinner.
+    """
+    if not reminder_times:
+        return
+
+    MEAL_TIME_MAP = {}
+    for i, t in enumerate(reminder_times):
+        if i < 3:
+            MEAL_TIME_MAP[t] = i
+
+    fired_today = set()
+
+    def _check_meal_logged(meal_idx):
+        try:
+            logged = check_meals_logged(session, date.today())
+            return logged.get(meal_idx, False)
+        except Exception:
+            return False
+
+    def _get_remaining():
+        try:
+            _, summary = get_diary_details(session, date.today())
+            remaining = summary.get("remaining", {})
+            cal = remaining.get("calories", "?")
+            protein = remaining.get("protein", "?")
+            return cal, protein
+        except Exception:
+            return "?", "?"
+
+    def _loop():
+        while not stop_event.is_set():
+            now = datetime.now()
+            day_key = now.strftime("%Y-%m-%d")
+            hhmm = now.strftime("%H:%M")
+
+            # Reset fired set on new day
+            if fired_today and not any(k.startswith(day_key) for k in fired_today):
+                fired_today.clear()
+
+            slot_key = f"{day_key} {hhmm}"
+            if hhmm in MEAL_TIME_MAP and slot_key not in fired_today:
+                meal_idx = MEAL_TIME_MAP[hhmm]
+                meal_name = MEALS[meal_idx]["name"]
+                if not _check_meal_logged(meal_idx):
+                    fired_today.add(slot_key)
+                    cal, protein = _get_remaining()
+                    msg = f"Hey, wanna log {meal_name.lower()}? You still need {cal} cal and {protein}g protein today."
+                    print(f"\n  Reminder: {msg}\n")
+                    speak(msg)
+
+            stop_event.wait(20)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+
+# ── Nightly summary ─────────────────────────────────────────────────────
+
+def _was_summary_sent_today():
+    try:
+        with open(SUMMARY_SENT_FILE, "r") as f:
+            last_date = f.read().strip()
+        return last_date == date.today().isoformat()
+    except (FileNotFoundError, ValueError):
+        return False
+
+
+def _mark_summary_sent():
+    with open(SUMMARY_SENT_FILE, "w") as f:
+        f.write(date.today().isoformat())
+
+
+def start_nightly_summary_loop(session, summary_time, stop_event):
+    """Background thread that texts a daily diet summary at the configured time."""
+    if not summary_time:
+        return
+
+    try:
+        h, m = summary_time.split(":")
+        target_h, target_m = int(h), int(m)
+        summary_time = f"{target_h:02d}:{target_m:02d}"
+    except (ValueError, AttributeError):
+        print(f"  [summary] Invalid time format: {summary_time}. Use HH:MM.")
+        return
+
+    def _send_summary():
+        try:
+            msg = build_daily_summary(session)
+            if msg:
+                ok = send_sms(msg)
+                if ok:
+                    _mark_summary_sent()
+                    print(f"\n  Sent nightly diet summary!\n")
+                    speak("Sent your nightly diet summary.")
+                    return True
+                else:
+                    print(f"\n  Couldn't send summary. Check config.\n")
+            else:
+                print(f"\n  No diary data to summarize today.\n")
+        except Exception as e:
+            print(f"\n  Error building summary: {e}\n")
+        return False
+
+    def _loop():
+        print(f"  [summary] Daily summary scheduled at {summary_time}")
+        while not stop_event.is_set():
+            now = datetime.now()
+            past_target = (now.hour > target_h or
+                           (now.hour == target_h and now.minute >= target_m))
+            if past_target and not _was_summary_sent_today():
+                _send_summary()
+            stop_event.wait(30)
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+
+# ── Push-to-talk engine ──────────────────────────────────────────────────
+
+class PushToTalk:
+    """Hold Option key to record, release to process."""
+
+    def __init__(self, whisper_model="base", reminder_times=None, summary_time=None):
+        print(f"\n{'═' * 50}")
+        print(f"  Diet Assistant — Push-to-Talk")
+        print(f"  Hold Option (Alt) key and speak")
+        print(f"{'═' * 50}\n")
+
+        print("  Loading Whisper model...")
+        from faster_whisper import WhisperModel
+        self.model = WhisperModel(whisper_model, device="cpu", compute_type="int8")
+
+        print("  Connecting to MyFitnessPal...")
+        self.session = create_session()
+
+        self._recording = False
+        self._audio_buffer = []
+        self._stream = None
+        self._lock = threading.Lock()
+        self._processing = False
+        self._stop_event = threading.Event()
+
+        # Start background reminders and nightly summary
+        if reminder_times:
+            print(f"  Reminders active: {', '.join(reminder_times)}")
+            start_reminder_loop(self.session, reminder_times, self._stop_event)
+        if summary_time:
+            print(f"  Nightly summary text at: {summary_time}")
+            start_nightly_summary_loop(self.session, summary_time, self._stop_event)
+
+        print("  Ready! Hold Option key and speak.\n")
+
+    def _start_recording(self):
+        """Start capturing audio."""
+        with self._lock:
+            if self._recording or self._processing:
+                return
+            self._recording = True
+            self._audio_buffer = []
+
+        print("  🎤 Recording...", end="", flush=True)
+
+        self._stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype=DTYPE,
+            blocksize=BLOCKSIZE,
+            callback=self._audio_callback,
+        )
+        self._stream.start()
+
+    def _audio_callback(self, indata, frames, time_info, status):
+        """Called by sounddevice for each audio block."""
+        if self._recording:
+            self._audio_buffer.append(indata.copy())
+
+    def _stop_recording(self):
+        """Stop recording and process the audio."""
+        with self._lock:
+            if not self._recording:
+                return
+            self._recording = False
+            self._processing = True
+            buffer = list(self._audio_buffer)
+
+        # Stop the stream
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+        if not buffer:
+            print("\r  (no audio captured)        ")
+            self._processing = False
+            return
+
+        # Convert buffer to raw bytes
+        audio_np = np.concatenate(buffer, axis=0)
+        raw_audio = audio_np.tobytes()
+        duration = len(raw_audio) / (SAMPLE_RATE * 2)
+
+        if duration < 0.3:
+            print("\r  (too short)                ")
+            self._processing = False
+            return
+
+        print(f"\r  Transcribing... ({duration:.1f}s)    ", end="", flush=True)
+
+        text = transcribe_audio(
+            self.model, raw_audio, SAMPLE_RATE,
+            initial_prompt=FOOD_CONTEXT_PROMPT,
+        )
+
+        if not text or len(text.strip()) < 2:
+            print("\r  (couldn't transcribe)        ")
+            self._processing = False
+            return
+
+        print(f"\r                                    ")
+
+        # Process the command
+        try:
+            response = process_command(self.session, text)
+            print(f"  Assistant: {response}\n")
+            speak(response)
+        except Exception as e:
+            error_msg = f"Error: {e}"
+            print(f"  {error_msg}")
+            speak("Something went wrong.")
+
+        self._processing = False
+
+    def run(self):
+        """Start listening for Option key."""
+        option_held = False
+
+        def on_press(key):
+            nonlocal option_held
+            if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
+                if not option_held:
+                    option_held = True
+                    self._start_recording()
+
+        def on_release(key):
+            nonlocal option_held
+            if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
+                if option_held:
+                    option_held = False
+                    # Process in a thread so key listener stays responsive
+                    threading.Thread(target=self._stop_recording, daemon=True).start()
+
+        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+            try:
+                listener.join()
+            except KeyboardInterrupt:
+                print("\n  Bye!")
+
+
+# ── Main ─────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Push-to-talk Diet Assistant")
+    parser.add_argument("--whisper-model", type=str, default="tiny",
+                        help="Whisper model size: tiny, base, small, medium (default: tiny)")
+    parser.add_argument("--reminder-times", type=str, default=DEFAULT_REMINDER_TIMES,
+                        help="Comma-separated HH:MM reminders (default: 09:30,13:30,19:30)")
+    parser.add_argument("--no-reminders", action="store_true", help="Disable timed reminders")
+    parser.add_argument("--summary-time", type=str, default=DEFAULT_SUMMARY_TIME,
+                        help="HH:MM time to text daily diet summary (default: 23:00)")
+    parser.add_argument("--no-summary", action="store_true", help="Disable nightly summary text")
+    args = parser.parse_args()
+
+    reminder_times = [] if args.no_reminders else parse_reminder_times(args.reminder_times)
+    summary_time = None if args.no_summary else args.summary_time
+
+    ptt = PushToTalk(
+        whisper_model=args.whisper_model,
+        reminder_times=reminder_times,
+        summary_time=summary_time,
+    )
+    ptt.run()
+
+
+if __name__ == "__main__":
+    main()

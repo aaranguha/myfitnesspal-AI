@@ -140,12 +140,12 @@ echo "  Diet Assistant needs Accessibility access"
 echo "  to listen for the Option key (push-to-talk)."
 echo ""
 echo "  I'll open the settings for you."
-echo "  Add ~/Applications/DietAssistant.app to the list."
+echo "  Add Terminal (or iTerm) to the list and toggle it ON."
 echo ""
 read -p "  Press Enter to open Accessibility settings..." </dev/tty
 open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 echo ""
-echo "  Once you've added DietAssistant.app, come back here."
+echo "  Once you've added Terminal, come back here."
 read -p "  Press Enter when done..." </dev/tty
 echo ""
 
@@ -158,16 +158,18 @@ START_NOW="${START_NOW:-Y}"
 if [[ "$START_NOW" =~ ^[Yy] ]]; then
   echo ""
   echo "  Starting Diet Assistant in the background..."
-  open "$USER_APPS/$APP_NAME.app"
+  cd "$INSTALL_DIR"
+  source venv/bin/activate
+  nohup python hotkey_assistant.py </dev/null >/dev/null 2>&1 &
   echo "  Running! Hold Option to speak, Option+Space to type."
   echo ""
-  echo "  Tip: to auto-start on login, add DietAssistant.app"
-  echo "  in System Settings → General → Login Items"
+  echo "  To start again later:"
+  echo "    cd $INSTALL_DIR && source venv/bin/activate && python hotkey_assistant.py &"
+  echo "    or: ./start.command"
 else
   echo ""
   echo "  No problem! To start later:"
-  echo "    Spotlight (Cmd+Space) → 'DietAssistant'"
-  echo "    or: cd $INSTALL_DIR && ./start.command"
+  echo "    cd $INSTALL_DIR && ./start.command"
 fi
 
 echo ""

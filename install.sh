@@ -4,11 +4,11 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────
 #  Diet Assistant — One-liner installer
 #
-#  curl -fsSL https://raw.githubusercontent.com/aaranguha/myfitnesspal-AI/master/install.sh | bash
+#  curl -fsSL https://raw.githubusercontent.com/aaranguha/myfitnesspal-AI/main/install.sh | bash
 # ─────────────────────────────────────────────────────
 
 REPO="https://github.com/aaranguha/myfitnesspal-AI.git"
-BRANCH="shareable-setup-flow"
+BRANCH="main"
 INSTALL_DIR="$HOME/diet-assistant"
 APP_NAME="DietAssistant"
 

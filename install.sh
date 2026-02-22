@@ -18,30 +18,49 @@ echo "║       Diet Assistant — Installer         ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
 
-# ── Check Python ──
-if ! command -v python3 &>/dev/null; then
-  echo "❌  Python 3 is required but not found."
-  echo "   Install it from https://www.python.org/downloads/"
-  exit 1
+# ── Helper: ensure Homebrew is installed ──
+ensure_brew() {
+  if ! command -v brew &>/dev/null; then
+    echo ""
+    echo "Installing Homebrew (free Mac package manager)..."
+    echo "This also installs Xcode Command Line Tools if needed (~5 min)."
+    echo ""
+    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    # Add brew to PATH for both Apple Silicon and Intel Macs
+    eval "$(/opt/homebrew/bin/brew shellenv)" 2>/dev/null \
+      || eval "$(/usr/local/bin/brew shellenv)" 2>/dev/null \
+      || true
+  fi
+}
+
+# ── Check / auto-install git ──
+if ! command -v git &>/dev/null; then
+  echo "git not found — installing via Homebrew..."
+  ensure_brew
+  brew install git
+fi
+echo "✓  git"
+
+# ── Check / auto-install Python 3.9+ ──
+PY_OK=false
+if command -v python3 &>/dev/null; then
+  PY_MAJOR=$(python3 -c "import sys; print(sys.version_info.major)")
+  PY_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
+  if [ "$PY_MAJOR" -ge 3 ] && [ "$PY_MINOR" -ge 9 ]; then
+    PY_OK=true
+  fi
+fi
+
+if ! $PY_OK; then
+  echo "Python 3.9+ not found — installing via Homebrew..."
+  ensure_brew
+  brew install python3
+  # Refresh python3 path
+  hash -r 2>/dev/null || true
 fi
 
 PY_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-PY_MAJOR=$(python3 -c "import sys; print(sys.version_info.major)")
-PY_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
-
-if [ "$PY_MAJOR" -lt 3 ] || ([ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 9 ]); then
-  echo "❌  Python 3.9+ is required (found $PY_VERSION)"
-  exit 1
-fi
 echo "✓  Python $PY_VERSION"
-
-# ── Check git ──
-if ! command -v git &>/dev/null; then
-  echo "❌  git is required but not found."
-  echo "   Run: xcode-select --install"
-  exit 1
-fi
-echo "✓  git"
 
 # ── Clone or update repo ──
 if [ -d "$INSTALL_DIR/.git" ]; then

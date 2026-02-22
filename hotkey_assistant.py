@@ -203,6 +203,8 @@ def process_log(session, food_desc, meal_idx):
             if s_meta and not search_metadata:
                 search_metadata = s_meta
             if results:
+                # Always sort custom (unverified) foods to the top
+                results = sorted(results, key=lambda r: (0 if not r.get("verified") else 1))
                 bundle = pick_meal_bundle_results(query, results)
                 if bundle:
                     for m in bundle:

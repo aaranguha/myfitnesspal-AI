@@ -509,10 +509,11 @@ def match_search_results_with_gpt(food_description, search_results):
     Ask GPT to pick the best match from MFP search results for a single food.
     Returns (matched_food_dict, confidence) or (None, "none").
     """
-    food_names = [
-        f"{i}: {f['name']}" + (f" ({f['cal_info']})" if f.get("cal_info") else "")
-        for i, f in enumerate(search_results)
-    ]
+    food_names = []
+    for i, f in enumerate(search_results):
+        tag = "[custom]" if not f.get("verified") else "[mfp]"
+        cal = f" ({f['cal_info']})" if f.get("cal_info") else ""
+        food_names.append(f"{i}: {tag} {f['name']}{cal}")
     food_list_str = "\n".join(food_names)
 
     response = client.chat.completions.create(
@@ -525,10 +526,11 @@ def match_search_results_with_gpt(food_description, search_results):
                     "You pick the SINGLE best match from MFP search results for a food item.\n\n"
                     'Return ONLY a JSON object: {"match": index_number, "confidence": "high"|"medium"|"low"}\n'
                     'If nothing matches well, return: {"match": null, "confidence": "none"}\n\n'
-                    "Rules:\n"
-                    "- Prefer generic entries over branded unless user specified a brand\n"
-                    "- Prefer verified/common entries\n"
-                    "- Return ONLY the JSON object"
+                    "Rules (in order of priority):\n"
+                    "1. If any result's name exactly matches or very closely matches the description, pick it — even if tagged [custom]\n"
+                    "2. [custom] entries are the user's own saved foods — strongly prefer them over [mfp] generic entries when the name matches\n"
+                    "3. Only prefer [mfp] entries if no [custom] entry is a reasonable match\n"
+                    "4. Return ONLY the JSON object"
                 ),
             },
             {

@@ -101,11 +101,13 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Copy icon into app bundle
+# Copy icon into app bundle (guard against src == dst when app is already in repo)
 RESOURCES_DIR="$APP_DIR/Contents/Resources"
 mkdir -p "$RESOURCES_DIR"
-if [ -f "$INSTALL_DIR/DietAssistant.app/Contents/Resources/AppIcon.icns" ]; then
-    cp "$INSTALL_DIR/DietAssistant.app/Contents/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+SRC_ICNS="$INSTALL_DIR/DietAssistant.app/Contents/Resources/AppIcon.icns"
+DST_ICNS="$RESOURCES_DIR/AppIcon.icns"
+if [ -f "$SRC_ICNS" ] && [ "$SRC_ICNS" != "$DST_ICNS" ]; then
+    cp "$SRC_ICNS" "$DST_ICNS"
 fi
 
 cat > "$MACOS_DIR/DietAssistant" <<LAUNCHER

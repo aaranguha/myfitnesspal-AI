@@ -169,8 +169,11 @@ START_NOW="${START_NOW:-Y}"
 if [[ "$START_NOW" =~ ^[Yy] ]]; then
   echo ""
   echo "  Starting Diet Assistant in the background..."
+  # Kill any existing instance first to avoid duplicates
+  pkill -f "hotkey_assistant.py" 2>/dev/null || true
+  sleep 1
   cd "$INSTALL_DIR"
-  nohup "$INSTALL_DIR/venv/bin/python" hotkey_assistant.py </dev/null >>"$INSTALL_DIR/hotkey.log" 2>&1 &
+  nohup "$INSTALL_DIR/venv/bin/python" -u hotkey_assistant.py </dev/null >>"$INSTALL_DIR/hotkey.log" 2>&1 &
   disown
   echo "  Running! Hold Option to speak, Option+Space to type."
   echo ""

@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Diet Assistant — AI-powered food logging for MyFitnessPal</title>
+  <meta name="description" content="Voice-powered food logging. Hold Option, speak, done. Works with MyFitnessPal." />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0a0f1e;
+      --card: #111827;
+      --border: #1e2d45;
+      --mfp-blue: #0066cc;
+      --mfp-blue-light: #1a80e0;
+      --text: #f0f4ff;
+      --muted: #8ba0c0;
+      --green: #22c55e;
+      --red: #ef4444;
+      --yellow: #eab308;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    /* ── Nav ── */
+    nav {
+      width: 100%;
+      max-width: 900px;
+      padding: 24px 32px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .logo-icon {
+      width: 32px; height: 32px; border-radius: 8px;
+      background: var(--mfp-blue);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 18px;
+    }
+    .logo-text { font-weight: 700; font-size: 17px; }
+
+    /* ── Hero ── */
+    .hero {
+      max-width: 900px;
+      width: 100%;
+      padding: 60px 32px 40px;
+      text-align: center;
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(0,102,204,0.18);
+      border: 1px solid rgba(0,102,204,0.4);
+      color: #60a5fa;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      padding: 4px 12px;
+      border-radius: 999px;
+      margin-bottom: 24px;
+    }
+    h1 {
+      font-size: clamp(36px, 6vw, 64px);
+      font-weight: 800;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      margin-bottom: 20px;
+    }
+    h1 span { color: var(--mfp-blue-light); }
+    .subtitle {
+      font-size: 18px;
+      color: var(--muted);
+      max-width: 520px;
+      margin: 0 auto 48px;
+      line-height: 1.6;
+    }
+
+    /* ── Install card ── */
+    .install-card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px 32px;
+      max-width: 680px;
+      margin: 0 auto;
+      text-align: left;
+    }
+    .install-label {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 14px;
+    }
+    .command-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: #0d1526;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 18px;
+      font-family: "SF Mono", "Fira Code", monospace;
+      font-size: 14px;
+    }
+    .prompt { color: var(--mfp-blue-light); user-select: none; }
+    .cmd { color: #e2e8f0; flex: 1; word-break: break-all; }
+    .copy-btn {
+      background: var(--mfp-blue);
+      border: none;
+      border-radius: 7px;
+      color: white;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 6px 14px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s;
+      flex-shrink: 0;
+    }
+    .copy-btn:hover { background: var(--mfp-blue-light); }
+    .copy-btn.copied { background: #16a34a; }
+    .install-note {
+      margin-top: 14px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .install-note a { color: #60a5fa; text-decoration: none; }
+    .install-note a:hover { text-decoration: underline; }
+
+    /* ── Features ── */
+    .features {
+      max-width: 900px;
+      width: 100%;
+      padding: 72px 32px 40px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 20px;
+    }
+    .feature {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px;
+    }
+    .feature-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      display: inline-block; margin-bottom: 14px;
+    }
+    .feature h3 { font-size: 15px; font-weight: 700; margin-bottom: 8px; }
+    .feature p { font-size: 13px; color: var(--muted); line-height: 1.6; }
+
+    /* ── How it works ── */
+    .how {
+      max-width: 900px;
+      width: 100%;
+      padding: 16px 32px 72px;
+      text-align: center;
+    }
+    .how h2 {
+      font-size: 28px; font-weight: 700; margin-bottom: 40px;
+      letter-spacing: -0.02em;
+    }
+    .steps {
+      display: flex;
+      gap: 0;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .step {
+      flex: 1;
+      min-width: 180px;
+      max-width: 220px;
+      padding: 0 16px;
+      position: relative;
+    }
+    .step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -10px;
+      top: 18px;
+      color: var(--border);
+      font-size: 20px;
+    }
+    .step-num {
+      width: 40px; height: 40px; border-radius: 50%;
+      background: rgba(0,102,204,0.2);
+      border: 1px solid rgba(0,102,204,0.4);
+      color: #60a5fa;
+      font-weight: 700; font-size: 15px;
+      display: flex; align-items: center; justify-content: center;
+      margin: 0 auto 14px;
+    }
+    .step h4 { font-size: 14px; font-weight: 700; margin-bottom: 6px; }
+    .step p { font-size: 12px; color: var(--muted); line-height: 1.5; }
+
+    /* ── Footer ── */
+    footer {
+      border-top: 1px solid var(--border);
+      width: 100%;
+      padding: 28px 32px;
+      text-align: center;
+      font-size: 13px;
+      color: var(--muted);
+      display: flex;
+      justify-content: center;
+      gap: 24px;
+      flex-wrap: wrap;
+    }
+    footer a { color: var(--muted); text-decoration: none; }
+    footer a:hover { color: var(--text); }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <div class="logo-icon">🏋️</div>
+    <span class="logo-text">Diet Assistant</span>
+  </nav>
+
+  <section class="hero">
+    <div class="badge">macOS · Free &amp; Open Source</div>
+    <h1>Log food with your <span>voice.</span></h1>
+    <p class="subtitle">
+      Hold Option, speak what you ate, release. Diet Assistant logs it to
+      MyFitnessPal instantly — no typing, no app-switching.
+    </p>
+
+    <div class="install-card">
+      <div class="install-label">Quick Start — one command installs everything</div>
+      <div class="command-row">
+        <span class="prompt">$</span>
+        <span class="cmd" id="cmd-text">curl -fsSL https://raw.githubusercontent.com/aaranguha/myfitnesspal-AI/main/install.sh | bash</span>
+        <button class="copy-btn" id="copy-btn" onclick="copyCmd()">Copy</button>
+      </div>
+      <p class="install-note">
+        Requires macOS &amp; Python 3.9+. Installs in ~2 minutes. &nbsp;·&nbsp;
+        <a href="https://github.com/aaranguha/myfitnesspal-AI" target="_blank">View source on GitHub →</a>
+      </p>
+    </div>
+  </section>
+
+  <section class="features">
+    <div class="feature">
+      <span class="feature-dot" style="background:var(--red)"></span>
+      <h3>Push-to-Talk</h3>
+      <p>Hold the Option key and speak. Release to log. No wake words, no buttons.</p>
+    </div>
+    <div class="feature">
+      <span class="feature-dot" style="background:var(--yellow)"></span>
+      <h3>Smart Matching</h3>
+      <p>GPT + your MFP history finds the right food entry every time, automatically.</p>
+    </div>
+    <div class="feature">
+      <span class="feature-dot" style="background:var(--green)"></span>
+      <h3>Logs to MyFitnessPal</h3>
+      <p>Works directly with your existing MFP account. No new apps or subscriptions.</p>
+    </div>
+    <div class="feature">
+      <span class="feature-dot" style="background:#a78bfa)"></span>
+      <span class="feature-dot" style="background:#a78bfa"></span>
+      <h3>Daily Summaries</h3>
+      <p>Get a nightly macro summary texted to you. Stay on track without opening the app.</p>
+    </div>
+    <div class="feature">
+      <span class="feature-dot" style="background:#fb923c"></span>
+      <h3>Visual Overlay</h3>
+      <p>A subtle floating bar shows listening / processing / response state in real time.</p>
+    </div>
+    <div class="feature">
+      <span class="feature-dot" style="background:var(--mfp-blue-light)"></span>
+      <h3>Type Mode</h3>
+      <p>Prefer typing? Hit Option + Space to enter a command without speaking.</p>
+    </div>
+  </section>
+
+  <section class="how">
+    <h2>How it works</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <h4>Install</h4>
+        <p>Run the one-liner. Wizard sets up your MFP cookie &amp; OpenAI key.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <h4>Hold Option</h4>
+        <p>The overlay bar appears. Speak what you ate naturally.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <h4>Release</h4>
+        <p>Assistant transcribes, matches, and logs to MFP in seconds.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <h4>Done</h4>
+        <p>Voice confirmation. Check MFP — it's already there.</p>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <a href="https://github.com/aaranguha/myfitnesspal-AI" target="_blank">GitHub</a>
+    <a href="https://github.com/aaranguha/myfitnesspal-AI/blob/main/README.md" target="_blank">Docs</a>
+    <span>Built with OpenAI · Whisper · MyFitnessPal</span>
+  </footer>
+
+  <script>
+    function copyCmd() {
+      const text = document.getElementById('cmd-text').textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        const btn = document.getElementById('copy-btn');
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = 'Copy';
+          btn.classList.remove('copied');
+        }, 2000);
+      });
+    }
+  </script>
+
+</body>
+</html>

@@ -98,16 +98,17 @@ def speak(text):
         return None
 
 
-def speak_synced(text, overlay_cmd):
+def speak_synced(text, overlay_cmd, cancel_event=None):
     """Speak text and show overlay result in sync with actual audio playback.
 
     Uses say -o to pre-render audio, then plays with afplay so we know
-    exactly when sound starts and stops.
+    exactly when sound starts and stops. Stops immediately if cancel_event is set.
     """
     if not text:
         return
     import tempfile
     tmp = None
+    proc = None
     try:
         tmp = tempfile.NamedTemporaryFile(suffix=".aiff", delete=False)
         tmp_path = tmp.name
@@ -120,16 +121,29 @@ def speak_synced(text, overlay_cmd):
             timeout=10,
         )
 
+        if cancel_event and cancel_event.is_set():
+            return
+
         # Play audio — show overlay the instant playback begins
         proc = subprocess.Popen(
             ["afplay", tmp_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         overlay_cmd(f"result:{text}")
-        proc.wait()  # overlay stays visible until audio finishes
+
+        # Wait for audio, but bail immediately if cancelled
+        while proc.poll() is None:
+            if cancel_event and cancel_event.is_set():
+                proc.terminate()
+                return
+            time.sleep(0.05)
+
         time.sleep(1.0)  # linger after voice ends
-        overlay_cmd("hide")
+        if not (cancel_event and cancel_event.is_set()):
+            overlay_cmd("hide")
     except Exception:
+        if proc:
+            proc.terminate()
         overlay_cmd("hide")
     finally:
         if tmp:

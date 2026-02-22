@@ -1,3 +1,12 @@
 {
-  "presets": {}
+  "presets": {
+    "kodiak cakes": {
+      "foods": [
+        {"search_name": "Kodiak Power Cakes Chocolate Chip", "servings": 1},
+        {"search_name": "Ghirardelli White Chocolate Chips", "servings": 1},
+        {"search_name": "Reddi Whip Fat Free Whipped Cream", "servings": 1},
+        {"search_name": "Sugar Free Maple Syrup", "servings": 1}
+      ]
+    }
+  }
 }

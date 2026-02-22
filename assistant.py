@@ -524,8 +524,9 @@ def match_search_results_with_gpt(food_description, search_results, prefer_custo
             'If nothing matches well, return: {"match": null, "confidence": "none"}\n\n'
             "IMPORTANT: The user said 'my [food]' — they want THEIR OWN saved custom food.\n"
             "Rules (in order of priority):\n"
-            "1. You MUST select a [custom] tagged entry if one exists and is related to the description\n"
-            "2. Only fall back to [mfp] if absolutely no [custom] entry is present\n"
+            "1. Among [custom] entries, pick the one whose name most closely matches the description — "
+            "prefer exact or near-exact name matches over partial matches\n"
+            "2. Only consider [mfp] entries if absolutely no [custom] entry is present\n"
             "3. Return ONLY the JSON object"
         )
     else:

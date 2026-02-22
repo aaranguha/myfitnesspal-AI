@@ -13,6 +13,7 @@ Usage:
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -69,7 +70,7 @@ from assistant import (
     split_food_descriptions,
 )
 
-from myfitnesspal import check_meals_logged, send_sms, send_sms_to, build_daily_summary
+from myfitnesspal import check_meals_logged, send_sms, send_sms_to, build_daily_summary, get_preset
 
 USER_NAME = os.getenv("USER_NAME", "Aaran")
 
@@ -155,10 +156,50 @@ def speak_synced(text, overlay_cmd, cancel_event=None):
 
 # ── Single-turn food logging ─────────────────────────────────────────────
 
-def process_log(session, food_desc, meal_idx):
+def process_preset_log(session, preset_name, meal_idx):
+    """Log all foods in a named preset. Returns list of logged food names."""
+    matched_name, preset = get_preset(preset_name)
+    if not matched_name or not preset:
+        return []
+
+    logged_names = []
+    foods = preset.get("foods", [])
+    print(f"  Logging preset \"{matched_name}\" ({len(foods)} foods)...")
+
+    # Get search metadata once
+    _, search_metadata = search_foods(session, foods[0]["search_name"] if foods else "", meal_idx)
+
+    for item in foods:
+        name = item["search_name"]
+        # Try recents first
+        all_foods, metadata = get_recent_foods_cached(session, meal_idx)
+        if all_foods:
+            match_results = match_foods_with_gpt(name, all_foods)
+            if match_results and match_results[0].get("matches"):
+                candidate = all_foods[match_results[0]["matches"][0]]
+                if has_reasonable_recent_overlap(name, [candidate["name"]]):
+                    if log_foods(session, [candidate], all_foods, meal_idx, metadata):
+                        logged_names.append(candidate["name"])
+                        invalidate_recents_cache(meal_idx)
+                        continue
+
+        # Fall back to MFP search
+        results, s_meta = search_foods(session, name, meal_idx)
+        if s_meta and not search_metadata:
+            search_metadata = s_meta
+        if results:
+            best, confidence = match_search_results_with_gpt(name, results)
+            if best and confidence in ("high", "medium"):
+                if log_searched_food(session, best, meal_idx, search_metadata or s_meta):
+                    logged_names.append(best["name"])
+                    invalidate_recents_cache(meal_idx)
+
+    return logged_names
+
+
+def process_log(session, food_desc, meal_idx, prefer_custom=False):
     """Log foods in a single turn — auto-resolve disambiguation."""
     meal_name = MEALS[meal_idx]["name"]
-    print(f"  Checking {meal_name} recents...")
 
     all_foods, metadata = get_recent_foods_cached(session, meal_idx)
 
@@ -167,10 +208,11 @@ def process_log(session, food_desc, meal_idx):
     pending_searched = []     # from MFP search
     search_metadata = None
 
-    # Step 1: Match against recents
-    if all_foods:
+    # Step 1: Match against recents (skipped when user says "my X")
+    not_found_descs = []
+    if all_foods and not prefer_custom:
+        print(f"  Checking {meal_name} recents...")
         match_results = match_foods_with_gpt(food_desc, all_foods)
-        not_found_descs = []
 
         for item in match_results:
             matches = item.get("matches", [])
@@ -194,8 +236,6 @@ def process_log(session, food_desc, meal_idx):
     # Step 2: Search MFP for anything not in recents
     for desc in not_found_descs:
         parts = split_compound_food_for_search(desc)
-        # Detect "my [food]" — user wants their own custom saved food
-        prefer_custom = bool(re.search(r"\bmy\b", desc, re.IGNORECASE))
         for part in parts:
             query = normalize_food_query(part)
             print(f"  Searching MFP for \"{query}\"...")
@@ -205,6 +245,10 @@ def process_log(session, food_desc, meal_idx):
             if results:
                 # Always sort custom (unverified) foods to the top
                 results = sorted(results, key=lambda r: (0 if not r.get("verified") else 1))
+                print(f"  [debug] Top results: " + " | ".join(
+                    f"{'[custom]' if not r.get('verified') else '[mfp]'} {r['name']}"
+                    for r in results[:5]
+                ))
                 bundle = pick_meal_bundle_results(query, results)
                 if bundle:
                     for m in bundle:
@@ -338,13 +382,26 @@ def process_command(session, text):
         _, msg = process_remove(session, food_desc, mentioned_meal)
         return msg
 
+    # ── Log meal preset ──
+    preset_name = parsed.get("preset_name")
+    if intent == "log_meal" and preset_name and not food_desc:
+        unlogged = get_unlogged_meals(session)
+        meal_idx = resolve_meal_idx(mentioned_meal, unlogged)
+        meal_name = MEALS[meal_idx]["name"]
+        logged = process_preset_log(session, preset_name, meal_idx)
+        if logged:
+            return f"Got it, logged your {preset_name} to {meal_name}."
+        return f"Couldn't find a preset called \"{preset_name}\"."
+
     # ── Log ──
-    if intent == "log" and food_desc:
+    if intent in ("log", "log_meal") and food_desc:
         unlogged = get_unlogged_meals(session)
         meal_idx = resolve_meal_idx(mentioned_meal, unlogged)
         meal_name = MEALS[meal_idx]["name"]
 
-        logged = process_log(session, food_desc, meal_idx)
+        # Detect "my X" in the raw text before GPT strips it
+        prefer_custom = bool(re.search(r"\bmy\b", text, re.IGNORECASE))
+        logged = process_log(session, food_desc, meal_idx, prefer_custom=prefer_custom)
         if logged:
             names = ", ".join(logged)
             return f"Got it, logged {names} to {meal_name}."

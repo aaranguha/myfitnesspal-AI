@@ -194,6 +194,8 @@ def process_log(session, food_desc, meal_idx):
     # Step 2: Search MFP for anything not in recents
     for desc in not_found_descs:
         parts = split_compound_food_for_search(desc)
+        # Detect "my [food]" — user wants their own custom saved food
+        prefer_custom = bool(re.search(r"\bmy\b", desc, re.IGNORECASE))
         for part in parts:
             query = normalize_food_query(part)
             print(f"  Searching MFP for \"{query}\"...")
@@ -206,7 +208,7 @@ def process_log(session, food_desc, meal_idx):
                     for m in bundle:
                         pending_searched.append(m)
                     continue
-                best, confidence = match_search_results_with_gpt(query, results)
+                best, confidence = match_search_results_with_gpt(query, results, prefer_custom=prefer_custom)
                 if best and confidence in ("high", "medium"):
                     pending_searched.append(best)
                 else:

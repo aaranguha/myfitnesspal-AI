@@ -504,10 +504,11 @@ def match_foods_with_gpt(food_description, food_list):
     return []
 
 
-def match_search_results_with_gpt(food_description, search_results):
+def match_search_results_with_gpt(food_description, search_results, prefer_custom=False):
     """
     Ask GPT to pick the best match from MFP search results for a single food.
     Returns (matched_food_dict, confidence) or (None, "none").
+    Set prefer_custom=True when the user said "my [food]" to force custom entry selection.
     """
     food_names = []
     for i, f in enumerate(search_results):
@@ -516,23 +517,34 @@ def match_search_results_with_gpt(food_description, search_results):
         food_names.append(f"{i}: {tag} {f['name']}{cal}")
     food_list_str = "\n".join(food_names)
 
+    if prefer_custom:
+        system_prompt = (
+            "You pick the SINGLE best match from MFP search results for a food item.\n\n"
+            'Return ONLY a JSON object: {"match": index_number, "confidence": "high"|"medium"|"low"}\n'
+            'If nothing matches well, return: {"match": null, "confidence": "none"}\n\n'
+            "IMPORTANT: The user said 'my [food]' — they want THEIR OWN saved custom food.\n"
+            "Rules (in order of priority):\n"
+            "1. You MUST select a [custom] tagged entry if one exists and is related to the description\n"
+            "2. Only fall back to [mfp] if absolutely no [custom] entry is present\n"
+            "3. Return ONLY the JSON object"
+        )
+    else:
+        system_prompt = (
+            "You pick the SINGLE best match from MFP search results for a food item.\n\n"
+            'Return ONLY a JSON object: {"match": index_number, "confidence": "high"|"medium"|"low"}\n'
+            'If nothing matches well, return: {"match": null, "confidence": "none"}\n\n'
+            "Rules (in order of priority):\n"
+            "1. If any result's name exactly matches or very closely matches the description, pick it — even if tagged [custom]\n"
+            "2. [custom] entries are the user's own saved foods — strongly prefer them over [mfp] generic entries when the name matches\n"
+            "3. Only prefer [mfp] entries if no [custom] entry is a reasonable match\n"
+            "4. Return ONLY the JSON object"
+        )
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         temperature=0,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You pick the SINGLE best match from MFP search results for a food item.\n\n"
-                    'Return ONLY a JSON object: {"match": index_number, "confidence": "high"|"medium"|"low"}\n'
-                    'If nothing matches well, return: {"match": null, "confidence": "none"}\n\n'
-                    "Rules (in order of priority):\n"
-                    "1. If any result's name exactly matches or very closely matches the description, pick it — even if tagged [custom]\n"
-                    "2. [custom] entries are the user's own saved foods — strongly prefer them over [mfp] generic entries when the name matches\n"
-                    "3. Only prefer [mfp] entries if no [custom] entry is a reasonable match\n"
-                    "4. Return ONLY the JSON object"
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": f"Looking for: {food_description}\n\nSearch results:\n{food_list_str}",
@@ -562,7 +574,7 @@ def normalize_food_query(food_text):
     """Strip conversational quantity words so search uses a cleaner food name."""
     q = food_text.strip().lower()
     q = re.sub(r"^(can you )?(just )?(log|add)\s+", "", q)
-    q = re.sub(r"^(a|an|the|some)\s+", "", q)
+    q = re.sub(r"^(a|an|the|some|my)\s+", "", q)
     q = re.sub(r"^(regular|normal|standard)\s+(serving|portion)\s+of\s+", "", q)
     q = re.sub(r"^(serving|portion)\s+of\s+", "", q)
     q = re.sub(r"\s+", " ", q).strip(" .")

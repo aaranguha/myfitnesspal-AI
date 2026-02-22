@@ -51,7 +51,16 @@ load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
 USER_NAME = os.getenv("USER_NAME", "Aaran")
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Use Groq (free) if GROQ_API_KEY is set, otherwise fall back to OpenAI
+if os.getenv("GROQ_API_KEY"):
+    client = OpenAI(
+        api_key=os.getenv("GROQ_API_KEY"),
+        base_url="https://api.groq.com/openai/v1",
+    )
+    GPT_MODEL = "llama-3.3-70b-versatile"
+else:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    GPT_MODEL = "gpt-4o-mini"
 
 MEAL_NAMES_TO_IDX = {info["name"].lower(): idx for idx, info in MEALS.items()}
 
@@ -370,7 +379,7 @@ def parse_user_message(user_message):
         presets_hint = f"\nThe user has these saved meal presets: {', '.join(preset_names)}\n"
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=GPT_MODEL,
         temperature=0,
         messages=[
             {
@@ -457,7 +466,7 @@ def match_foods_with_gpt(food_description, food_list):
     food_list_str = "\n".join(food_names)
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=GPT_MODEL,
         temperature=0,
         messages=[
             {
@@ -542,7 +551,7 @@ def match_search_results_with_gpt(food_description, search_results, prefer_custo
         )
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=GPT_MODEL,
         temperature=0,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -633,7 +642,7 @@ def split_compound_food_for_search(food_text):
     # GPT fallback for compound phrases without separators.
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=GPT_MODEL,
             temperature=0,
             messages=[
                 {
@@ -827,7 +836,7 @@ def pick_meal_bundle_results(search_query, search_results, max_items=6):
 def smart_reply(user_input, diary_context):
     """Let GPT answer a question using diary data."""
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=GPT_MODEL,
         temperature=0.5,
         messages=[
             {
@@ -853,7 +862,7 @@ def parse_per_food_quantities_with_gpt(user_input, pending_names):
         return {}
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=GPT_MODEL,
             temperature=0,
             messages=[
                 {
@@ -1583,7 +1592,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
 
                 # Single GPT call to understand what the user wants
                 confirm_resp = client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model=GPT_MODEL,
                     temperature=0,
                     messages=[
                         {
@@ -1746,7 +1755,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
                         food_list_str = "\n".join(food_names_list)
 
                         pick_resp = client.chat.completions.create(
-                            model="gpt-4o-mini",
+                            model=GPT_MODEL,
                             temperature=0,
                             messages=[
                                 {
@@ -1801,7 +1810,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
                         f"Be concise. After answering, remind them they can say yes to log or no to cancel."
                     )
                     resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
+                        model=GPT_MODEL,
                         temperature=0,
                         messages=[
                             {"role": "system", "content": food_question_prompt},
@@ -1944,7 +1953,7 @@ def run_terminal_chat(reminder_times=None, summary_time=None, input_provider=Non
                 # Use GPT to match which logged food(s) to remove
                 food_names_list = [f"{i}: {f['name']}" for i, f in enumerate(candidates)]
                 response = client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model=GPT_MODEL,
                     temperature=0,
                     messages=[
                         {

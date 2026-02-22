@@ -22,6 +22,7 @@ APP_DIR = Path.home() / ".diet_assistant"
 CONFIG_FILE = APP_DIR / "config.json"
 MFP_DIARY_URL = "https://www.myfitnesspal.com/food/diary"
 OPENAI_MODELS_URL = "https://api.openai.com/v1/models"
+GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 MFP_LOGIN_URL = "https://www.myfitnesspal.com/account/login"
 
 DEFAULTS = {
@@ -31,6 +32,7 @@ DEFAULTS = {
     "MY_PHONE_NUMBER": "",
     "SMS_PHONE_NUMBERS": "",
     "OPENAI_API_KEY": "",
+    "GROQ_API_KEY": "",
     "MFP_COOKIE": "",
 }
 
@@ -109,6 +111,26 @@ def validate_openai_key(api_key: str) -> tuple[bool, str]:
     return False, f"Unexpected OpenAI response: {resp.status_code}"
 
 
+def validate_groq_key(api_key: str) -> tuple[bool, str]:
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return False, "Groq API key is required."
+    if not api_key.startswith("gsk_"):
+        return False, "Groq API key should start with 'gsk_'."
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        resp = requests.get(GROQ_MODELS_URL, headers=headers, timeout=12)
+    except Exception as exc:
+        return False, f"Could not reach Groq: {exc}"
+
+    if resp.status_code == 200:
+        return True, "Groq API key works."
+    if resp.status_code in (401, 403):
+        return False, "Groq API key was rejected."
+    return False, f"Unexpected Groq response: {resp.status_code}"
+
+
 def _build_config_from_values(values: dict) -> tuple[dict, str | None]:
     config = dict(DEFAULTS)
     for key in config:
@@ -116,8 +138,8 @@ def _build_config_from_values(values: dict) -> tuple[dict, str | None]:
 
     if not config["USER_NAME"]:
         return config, "Name is required."
-    if not config["OPENAI_API_KEY"]:
-        return config, "OpenAI API key is required."
+    if not config["OPENAI_API_KEY"] and not config["GROQ_API_KEY"]:
+        return config, "An API key is required (OpenAI or Groq)."
     if not config["MFP_COOKIE"]:
         return config, "MyFitnessPal connection is required."
     return config, None
@@ -230,7 +252,8 @@ def run_setup_wizard() -> bool:
 
     fields = [
         ("USER_NAME", "Your name", False),
-        ("OPENAI_API_KEY", "OpenAI API key", True),
+        ("GROQ_API_KEY", "Groq API key — free at console.groq.com (recommended)", True),
+        ("OPENAI_API_KEY", "OpenAI API key — paid, only if not using Groq", True),
         ("MFP_COOKIE", "MyFitnessPal cookie (paste from browser DevTools)", True),
         ("REMINDER_TIMES", "Reminder times (HH:MM, comma-separated)", False),
         ("SUMMARY_TIME", "Nightly summary time (HH:MM)", False),
@@ -302,12 +325,20 @@ def run_setup_wizard() -> bool:
             messagebox.showerror("Setup Error", err)
             return
 
-        status_var.set("Testing OpenAI key...")
-        root.update_idletasks()
-        ok_openai, msg_openai = validate_openai_key(cfg["OPENAI_API_KEY"])
-        if not ok_openai:
-            status_var.set(msg_openai)
-            messagebox.showerror("OpenAI Test Failed", msg_openai)
+        if cfg["GROQ_API_KEY"]:
+            status_var.set("Testing Groq key...")
+            root.update_idletasks()
+            ok_llm, msg_llm = validate_groq_key(cfg["GROQ_API_KEY"])
+            provider = "Groq"
+        else:
+            status_var.set("Testing OpenAI key...")
+            root.update_idletasks()
+            ok_llm, msg_llm = validate_openai_key(cfg["OPENAI_API_KEY"])
+            provider = "OpenAI"
+
+        if not ok_llm:
+            status_var.set(msg_llm)
+            messagebox.showerror(f"{provider} Test Failed", msg_llm)
             return
 
         status_var.set("Testing MyFitnessPal connection...")
@@ -319,7 +350,7 @@ def run_setup_wizard() -> bool:
             return
 
         status_var.set("Both checks passed.")
-        messagebox.showinfo("Success", "OpenAI + MyFitnessPal checks passed.")
+        messagebox.showinfo("Success", f"{provider} + MyFitnessPal checks passed.")
 
     def save_and_close() -> None:
         cfg, err = _build_config_from_values(collect_values())
@@ -395,9 +426,23 @@ def run_setup_cli() -> bool:
 
             print("Let's try again.")
 
+    # ── LLM provider choice ──────────────────────────────────────────────
+    print("\nLLM Provider (used for AI food matching):")
+    print("  1) Groq  — FREE, sign up at console.groq.com (recommended for friends)")
+    print("  2) OpenAI — paid, use if you already have a key")
+    provider_choice = input("Choose [1]: ").strip() or "1"
+
+    groq_key = ""
+    openai_key = ""
+    if provider_choice == "2":
+        openai_key = ask("OPENAI_API_KEY", "Paste OpenAI API key")
+    else:
+        groq_key = ask("GROQ_API_KEY", "Paste Groq API key (from console.groq.com)")
+
     values = {
         "USER_NAME": ask("USER_NAME", "Your name"),
-        "OPENAI_API_KEY": ask("OPENAI_API_KEY", "Paste OpenAI API key here (visible input)"),
+        "OPENAI_API_KEY": openai_key,
+        "GROQ_API_KEY": groq_key,
         "MFP_COOKIE": choose_mfp_cookie(),
         "REMINDER_TIMES": ask("REMINDER_TIMES", "Reminder times (HH:MM, comma-separated)"),
         "SUMMARY_TIME": ask("SUMMARY_TIME", "Nightly summary time (HH:MM)"),
@@ -413,9 +458,13 @@ def run_setup_cli() -> bool:
         return False
 
     print("\nTesting credentials...")
-    ok_openai, msg_openai = validate_openai_key(cfg["OPENAI_API_KEY"])
-    print(f"OpenAI: {msg_openai}")
-    if not ok_openai:
+    if cfg["GROQ_API_KEY"]:
+        ok_llm, msg_llm = validate_groq_key(cfg["GROQ_API_KEY"])
+        print(f"Groq: {msg_llm}")
+    else:
+        ok_llm, msg_llm = validate_openai_key(cfg["OPENAI_API_KEY"])
+        print(f"OpenAI: {msg_llm}")
+    if not ok_llm:
         return False
 
     ok_mfp, msg_mfp = validate_mfp_cookie(cfg["MFP_COOKIE"])
@@ -439,7 +488,8 @@ def apply_user_config(env: dict | None = None) -> dict:
 
 def ensure_user_config() -> bool:
     cfg = load_user_config()
-    if cfg.get("OPENAI_API_KEY") and cfg.get("MFP_COOKIE") and cfg.get("USER_NAME"):
+    has_llm_key = bool(cfg.get("OPENAI_API_KEY") or cfg.get("GROQ_API_KEY"))
+    if has_llm_key and cfg.get("MFP_COOKIE") and cfg.get("USER_NAME"):
         return True
     return run_setup_wizard()
 

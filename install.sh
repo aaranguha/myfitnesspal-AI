@@ -159,8 +159,7 @@ if [[ "$START_NOW" =~ ^[Yy] ]]; then
   echo ""
   echo "  Starting Diet Assistant in the background..."
   cd "$INSTALL_DIR"
-  source venv/bin/activate
-  nohup python hotkey_assistant.py </dev/null >/dev/null 2>&1 &
+  nohup "$INSTALL_DIR/venv/bin/python" hotkey_assistant.py </dev/null >>"$INSTALL_DIR/hotkey.log" 2>&1 &
   echo "  Running! Hold Option to speak, Option+Space to type."
   echo ""
   echo "  To start again later:"

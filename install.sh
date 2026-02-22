@@ -122,7 +122,7 @@ echo "════════════════════════�
 echo ""
 
 export DIET_ASSISTANT_SETUP_MODE=cli
-python3 setup_wizard.py
+python3 setup_wizard.py </dev/tty
 
 # ── Done! ──
 echo ""

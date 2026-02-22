@@ -93,11 +93,20 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
     <string>DietAssistant</string>
     <key>CFBundleVersion</key>
     <string>1.0</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>LSBackgroundOnly</key>
     <true/>
 </dict>
 </plist>
 PLIST
+
+# Copy icon into app bundle
+RESOURCES_DIR="$APP_DIR/Contents/Resources"
+mkdir -p "$RESOURCES_DIR"
+if [ -f "$INSTALL_DIR/DietAssistant.app/Contents/Resources/AppIcon.icns" ]; then
+    cp "$INSTALL_DIR/DietAssistant.app/Contents/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+fi
 
 cat > "$MACOS_DIR/DietAssistant" <<LAUNCHER
 #!/bin/bash

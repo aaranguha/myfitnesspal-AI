@@ -577,11 +577,30 @@ class PushToTalk:
                             threading.Thread(
                                 target=self._process_typed, args=(typed_text,), daemon=True
                             ).start()
+                    elif text == "dismissed":
+                        self._dismiss()
             except Exception:
                 pass
 
         t = threading.Thread(target=reader, daemon=True)
         t.start()
+
+    def _dismiss(self):
+        """User clicked outside the overlay — cancel whatever is happening."""
+        self._typing_active = False
+        with self._lock:
+            if self._recording:
+                self._recording = False
+                if self._stream:
+                    try:
+                        self._stream.stop()
+                        self._stream.close()
+                    except Exception:
+                        pass
+                    self._stream = None
+                self._audio_buffer = []
+                print("\r  (cancelled)                ")
+            self._processing = False
 
     def _process_typed(self, text):
         """Process a typed command — no TTS, only overlay + terminal output."""

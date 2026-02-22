@@ -140,6 +140,10 @@ class OverlayController(NSObject):
         self.window.setHasShadow_(True)
         self.window.setIgnoresMouseEvents_(True)
 
+        # Global click monitor — dismiss bar when clicking anywhere outside it
+        self._click_monitor = None
+        self._install_click_monitor()
+
         # Status view (recording/processing/result)
         self.view = OverlayView.alloc().initWithFrame_(
             AppKit.NSMakeRect(0, 0, BAR_WIDTH, BAR_HEIGHT)
@@ -164,6 +168,35 @@ class OverlayController(NSObject):
         self._text_field.setDelegate_(self._text_delegate)
 
         self.view.addSubview_(self._text_field)
+
+    @objc.python_method
+    def _install_click_monitor(self):
+        """Install a global event monitor that dismisses the bar on any click outside it."""
+        if self._click_monitor:
+            return
+
+        mask = (
+            AppKit.NSEventMaskLeftMouseDown
+            | AppKit.NSEventMaskRightMouseDown
+            | AppKit.NSEventMaskOtherMouseDown
+        )
+
+        def handler(event):
+            if not self._visible:
+                return event
+            # Check if click is inside the overlay window
+            click_loc = AppKit.NSEvent.mouseLocation()
+            win_frame = self.window.frame()
+            if not AppKit.NSPointInRect(click_loc, win_frame):
+                # Click outside — dismiss and notify parent
+                self._hide()
+                sys.stdout.write("dismissed\n")
+                sys.stdout.flush()
+            return event
+
+        self._click_monitor = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            mask, handler
+        )
 
     @objc.python_method
     def _show(self, state, text=None):

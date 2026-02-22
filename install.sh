@@ -130,20 +130,46 @@ echo "╔═══════════════════════�
 echo "║         Installation complete!           ║"
 echo "╚══════════════════════════════════════════╝"
 echo ""
-echo "  How to use:"
+
+# ── Grant Accessibility permission ──
+echo "════════════════════════════════════════════"
+echo "  Accessibility Permission (required)"
+echo "════════════════════════════════════════════"
 echo ""
-echo "  Terminal mode:"
-echo "    cd $INSTALL_DIR && ./start.command"
+echo "  Diet Assistant needs Accessibility access"
+echo "  to listen for the Option key (push-to-talk)."
 echo ""
-echo "  Background hotkey mode:"
-echo "    Open Spotlight (Cmd+Space) → type 'DietAssistant' → Enter"
-echo "    Hold Option to speak, Option+Space to type"
+echo "  I'll open the settings for you."
+echo "  Add ~/Applications/DietAssistant.app to the list."
 echo ""
-echo "  Auto-start on login:"
-echo "    System Settings → General → Login Items"
-echo "    Add: ~/Applications/DietAssistant.app"
+read -p "  Press Enter to open Accessibility settings..." </dev/tty
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 echo ""
-echo "  Grant Accessibility permission (required for hotkey):"
-echo "    System Settings → Privacy & Security → Accessibility"
-echo "    Add: ~/Applications/DietAssistant.app"
+echo "  Once you've added DietAssistant.app, come back here."
+read -p "  Press Enter when done..." </dev/tty
+echo ""
+
+# ── Start the app ──
+echo "════════════════════════════════════════════"
+echo ""
+read -p "  Start Diet Assistant now? [Y/n]: " START_NOW </dev/tty
+START_NOW="${START_NOW:-Y}"
+
+if [[ "$START_NOW" =~ ^[Yy] ]]; then
+  echo ""
+  echo "  Starting Diet Assistant in the background..."
+  open "$USER_APPS/$APP_NAME.app"
+  echo "  Running! Hold Option to speak, Option+Space to type."
+  echo ""
+  echo "  Tip: to auto-start on login, add DietAssistant.app"
+  echo "  in System Settings → General → Login Items"
+else
+  echo ""
+  echo "  No problem! To start later:"
+  echo "    Spotlight (Cmd+Space) → 'DietAssistant'"
+  echo "    or: cd $INSTALL_DIR && ./start.command"
+fi
+
+echo ""
+echo "  Enjoy! 🎉"
 echo ""

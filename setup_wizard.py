@@ -27,7 +27,8 @@ MFP_LOGIN_URL = "https://www.myfitnesspal.com/account/login"
 DEFAULTS = {
     "USER_NAME": "Friend",
     "REMINDER_TIMES": "09:30,13:30,19:30",
-    "SUMMARY_TIME": "23:49",
+    "SUMMARY_TIME": "23:00",
+    "MY_PHONE_NUMBER": "",
     "SMS_PHONE_NUMBERS": "",
     "OPENAI_API_KEY": "",
     "MFP_COOKIE": "",
@@ -233,7 +234,8 @@ def run_setup_wizard() -> bool:
         ("MFP_COOKIE", "MyFitnessPal cookie (paste from browser DevTools)", True),
         ("REMINDER_TIMES", "Reminder times (HH:MM, comma-separated)", False),
         ("SUMMARY_TIME", "Nightly summary time (HH:MM)", False),
-        ("SMS_PHONE_NUMBERS", "Phone numbers for summary (comma-separated, optional)", False),
+        ("MY_PHONE_NUMBER", "Your phone number (+1XXXXXXXXXX)", False),
+        ("SMS_PHONE_NUMBERS", "Trainer/accountability partner numbers (comma-separated, optional)", False),
     ]
 
     widgets = {}
@@ -399,7 +401,10 @@ def run_setup_cli() -> bool:
         "MFP_COOKIE": choose_mfp_cookie(),
         "REMINDER_TIMES": ask("REMINDER_TIMES", "Reminder times (HH:MM, comma-separated)"),
         "SUMMARY_TIME": ask("SUMMARY_TIME", "Nightly summary time (HH:MM)"),
-        "SMS_PHONE_NUMBERS": ask("SMS_PHONE_NUMBERS", "Summary phone numbers (optional)"),
+        "MY_PHONE_NUMBER": ask("MY_PHONE_NUMBER", "Your phone number (+1XXXXXXXXXX)"),
+        "SMS_PHONE_NUMBERS": ask("SMS_PHONE_NUMBERS",
+            "Trainer/accountability partner numbers (comma-separated, optional)\n"
+            "  Nightly summary will be sent to you AND these numbers"),
     }
 
     cfg, err = _build_config_from_values(values)

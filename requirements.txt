@@ -1,0 +1,10 @@
+python-dotenv
+openai
+requests
+lxml
+numpy
+sounddevice
+pynput
+faster-whisper
+webrtcvad
+pyobjc-framework-Cocoa

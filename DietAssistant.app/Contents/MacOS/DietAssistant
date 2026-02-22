@@ -1,4 +1,5 @@
 #!/bin/bash
-cd "/Users/aguha2021/Desktop/CS_Projects/Claude Bot Gym"
+# Navigate to the app's parent folder (where the .py files live)
+cd "$(dirname "$0")/../../.."
 source venv/bin/activate
 exec python hotkey_assistant.py

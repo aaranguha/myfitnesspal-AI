@@ -523,17 +523,25 @@ def log_searched_food(session, food, meal_idx, metadata, quantity="1"):
 # ── SMS / daily summary ──────────────────────────────────────────────────
 
 def send_sms(body):
-    """Send an iMessage via macOS Messages app to all numbers in SMS_PHONE_NUMBERS. Returns True if any succeeded."""
+    """Send an iMessage via macOS Messages app to the user + all trainer numbers. Returns True if any succeeded."""
     import subprocess
 
-    phones_raw = os.getenv("SMS_PHONE_NUMBERS", "")
-    if not phones_raw:
-        print("  [sms] No phone numbers configured in SMS_PHONE_NUMBERS.")
-        return False
+    phones = []
 
-    phones = [p.strip() for p in phones_raw.split(",") if p.strip()]
+    # Always include the user's own number
+    my_number = (os.getenv("MY_PHONE_NUMBER") or "").strip()
+    if my_number:
+        phones.append(my_number)
+
+    # Add trainer/accountability partner numbers
+    phones_raw = os.getenv("SMS_PHONE_NUMBERS", "")
+    for p in phones_raw.split(","):
+        p = p.strip()
+        if p and p not in phones:
+            phones.append(p)
+
     if not phones:
-        print("  [sms] No phone numbers configured in SMS_PHONE_NUMBERS.")
+        print("  [sms] No phone numbers configured (MY_PHONE_NUMBER / SMS_PHONE_NUMBERS).")
         return False
 
     # Escape special characters for AppleScript

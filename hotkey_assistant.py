@@ -27,6 +27,16 @@ from pynput import keyboard
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
+# Load per-user config from ~/.diet_assistant/config.json (for friend installs)
+try:
+    from setup_wizard import apply_user_config, ensure_user_config
+    _user_env = apply_user_config()
+    for _k, _v in _user_env.items():
+        if _v and _k not in os.environ:
+            os.environ[_k] = _v
+except ImportError:
+    pass
+
 # Import voice helpers
 from voice_io import FOOD_CONTEXT_PROMPT, transcribe_audio
 
@@ -79,13 +89,54 @@ BLOCKSIZE = 1024  # frames per read
 # ── TTS ──────────────────────────────────────────────────────────────────
 
 def speak(text):
-    """Speak text using macOS say command (non-blocking)."""
+    """Speak text using macOS say. Non-blocking, returns Popen process."""
+    if not text:
+        return None
+    try:
+        return subprocess.Popen(["say", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+
+
+def speak_synced(text, overlay_cmd):
+    """Speak text and show overlay result in sync with actual audio playback.
+
+    Uses say -o to pre-render audio, then plays with afplay so we know
+    exactly when sound starts and stops.
+    """
     if not text:
         return
+    import tempfile
+    tmp = None
     try:
-        subprocess.Popen(["say", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        tmp = tempfile.NamedTemporaryFile(suffix=".aiff", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+
+        # Pre-render speech to file (fast, no audio output)
+        subprocess.run(
+            ["say", "-o", tmp_path, text],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+
+        # Play audio — show overlay the instant playback begins
+        proc = subprocess.Popen(
+            ["afplay", tmp_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        overlay_cmd(f"result:{text}")
+        proc.wait()  # overlay stays visible until audio finishes
+        time.sleep(1.0)  # linger after voice ends
+        overlay_cmd("hide")
     except Exception:
-        pass
+        overlay_cmd("hide")
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ── Single-turn food logging ─────────────────────────────────────────────
@@ -460,6 +511,21 @@ class PushToTalk:
         print(f"  Hold Option (Alt) key and speak")
         print(f"{'═' * 50}\n")
 
+        # Launch floating overlay bar
+        self._overlay = None
+        try:
+            overlay_path = os.path.join(SCRIPT_DIR, "overlay.py")
+            if os.path.exists(overlay_path):
+                self._overlay = subprocess.Popen(
+                    [sys.executable, overlay_path],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                print("  Overlay bar ready.")
+        except Exception as e:
+            print(f"  (overlay unavailable: {e})")
+
         print("  Loading Whisper model...")
         from faster_whisper import WhisperModel
         self.model = WhisperModel(whisper_model, device="cpu", compute_type="int8")
@@ -474,6 +540,10 @@ class PushToTalk:
         self._processing = False
         self._stop_event = threading.Event()
 
+        # Start reading overlay stdout for typed commands
+        if self._overlay:
+            self._start_overlay_reader()
+
         # Start background reminders and nightly summary
         if reminder_times:
             print(f"  Reminders active: {', '.join(reminder_times)}")
@@ -482,7 +552,72 @@ class PushToTalk:
             print(f"  Nightly summary text at: {summary_time}")
             start_nightly_summary_loop(self.session, summary_time, self._stop_event)
 
-        print("  Ready! Hold Option key and speak.\n")
+        self._typing_active = False  # True when overlay text field is open
+
+        print("  Ready! Hold Option to speak, Option+Space to type.\n")
+
+    def _overlay_cmd(self, cmd):
+        """Send a command to the overlay subprocess."""
+        if self._overlay and self._overlay.poll() is None:
+            try:
+                self._overlay.stdin.write(f"{cmd}\n".encode())
+                self._overlay.stdin.flush()
+            except Exception:
+                pass
+
+    def _start_overlay_reader(self):
+        """Background thread that reads typed commands from the overlay's stdout."""
+        def reader():
+            try:
+                for line in self._overlay.stdout:
+                    text = line.decode().strip()
+                    if text.startswith("typed:"):
+                        typed_text = text[6:].strip()
+                        if typed_text:
+                            threading.Thread(
+                                target=self._process_typed, args=(typed_text,), daemon=True
+                            ).start()
+            except Exception:
+                pass
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+
+    def _process_typed(self, text):
+        """Process a typed command — no TTS, only overlay + terminal output."""
+        self._typing_active = False
+        with self._lock:
+            if self._processing:
+                return
+            self._processing = True
+
+        self._overlay_cmd("processing")
+
+        try:
+            response = process_command(self.session, text)
+            print(f"  Assistant: {response}\n")
+            self._overlay_cmd(f"result:{response}")
+        except Exception as e:
+            print(f"  Error: {e}")
+            self._overlay_cmd("hide")
+
+        self._processing = False
+
+    def _start_typing_mode(self):
+        """Switch to typing mode — show text field in overlay."""
+        with self._lock:
+            if self._processing:
+                return
+            # Cancel any recording in progress
+            if self._recording:
+                self._recording = False
+                if self._stream:
+                    self._stream.stop()
+                    self._stream.close()
+                    self._stream = None
+        self._typing_active = True
+        self._overlay_cmd("typing")
+        print("  Type your command in the overlay bar...", flush=True)
 
     def _start_recording(self):
         """Start capturing audio."""
@@ -492,6 +627,7 @@ class PushToTalk:
             self._recording = True
             self._audio_buffer = []
 
+        self._overlay_cmd("recording")
         print("  🎤 Recording...", end="", flush=True)
 
         self._stream = sd.InputStream(
@@ -525,6 +661,7 @@ class PushToTalk:
 
         if not buffer:
             print("\r  (no audio captured)        ")
+            self._overlay_cmd("hide")
             self._processing = False
             return
 
@@ -535,9 +672,11 @@ class PushToTalk:
 
         if duration < 0.3:
             print("\r  (too short)                ")
+            self._overlay_cmd("hide")
             self._processing = False
             return
 
+        self._overlay_cmd("processing")
         print(f"\r  Transcribing... ({duration:.1f}s)    ", end="", flush=True)
 
         text = transcribe_audio(
@@ -547,6 +686,7 @@ class PushToTalk:
 
         if not text or len(text.strip()) < 2:
             print("\r  (couldn't transcribe)        ")
+            self._overlay_cmd("hide")
             self._processing = False
             return
 
@@ -556,32 +696,64 @@ class PushToTalk:
         try:
             response = process_command(self.session, text)
             print(f"  Assistant: {response}\n")
-            speak(response)
+            # Pre-render speech, then play + show overlay perfectly in sync
+            speak_synced(response, self._overlay_cmd)
         except Exception as e:
             error_msg = f"Error: {e}"
             print(f"  {error_msg}")
+            self._overlay_cmd("hide")
             speak("Something went wrong.")
 
         self._processing = False
 
     def run(self):
-        """Start listening for Option key."""
+        """Start listening for Option key (voice) and Option+Space (typing)."""
         option_held = False
+        space_pressed_during_option = False
+        record_timer = None
+
+        def _delayed_record():
+            """Start recording after a short delay (so Option+Space can cancel it)."""
+            if option_held and not space_pressed_during_option and not self._typing_active:
+                self._start_recording()
 
         def on_press(key):
-            nonlocal option_held
+            nonlocal option_held, space_pressed_during_option, record_timer
+            # Ignore key events while typing in overlay
+            if self._typing_active:
+                return
+
             if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
                 if not option_held:
                     option_held = True
-                    self._start_recording()
+                    space_pressed_during_option = False
+                    # Delay recording start by 200ms so Space can interrupt
+                    record_timer = threading.Timer(0.2, _delayed_record)
+                    record_timer.start()
+
+            # Option + Space → typing mode
+            if key == keyboard.Key.space and option_held and not space_pressed_during_option:
+                space_pressed_during_option = True
+                if record_timer:
+                    record_timer.cancel()
+                    record_timer = None
+                self._start_typing_mode()
 
         def on_release(key):
-            nonlocal option_held
+            nonlocal option_held, space_pressed_during_option, record_timer
+            # Ignore key events while typing in overlay
+            if self._typing_active:
+                return
+
             if key == keyboard.Key.alt or key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
                 if option_held:
                     option_held = False
-                    # Process in a thread so key listener stays responsive
-                    threading.Thread(target=self._stop_recording, daemon=True).start()
+                    if record_timer:
+                        record_timer.cancel()
+                        record_timer = None
+                    # Only process voice if we didn't switch to typing mode
+                    if not space_pressed_during_option:
+                        threading.Thread(target=self._stop_recording, daemon=True).start()
 
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
             try:
@@ -593,6 +765,15 @@ class PushToTalk:
 # ── Main ─────────────────────────────────────────────────────────────────
 
 def main():
+    # Ensure user has completed first-time setup
+    try:
+        from setup_wizard import ensure_user_config
+        if not ensure_user_config():
+            print("Setup not completed. Run again when ready.")
+            sys.exit(1)
+    except ImportError:
+        pass
+
     parser = argparse.ArgumentParser(description="Push-to-talk Diet Assistant")
     parser.add_argument("--whisper-model", type=str, default="tiny",
                         help="Whisper model size: tiny, base, small, medium (default: tiny)")

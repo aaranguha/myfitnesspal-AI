@@ -293,6 +293,68 @@ def process_log(session, food_desc, meal_idx, prefer_custom=False):
     return logged_names
 
 
+def process_update_serving(session, food_desc, mentioned_meal, servings):
+    """Change the serving count of an already-logged food: delete it, re-log at new quantity."""
+    from datetime import date as _date
+    diary, _ = get_diary_details(session, _date.today())
+
+    # Resolve which meal to look in
+    unlogged = get_unlogged_meals(session)
+    meal_idx = resolve_meal_idx(mentioned_meal, unlogged)
+
+    # Search all meals if no meal specified
+    search_meals = [meal_idx] if mentioned_meal else list(diary.keys())
+
+    # Find the matching entry using GPT food matching
+    found_entry = None
+    found_meal_idx = meal_idx
+    for m_idx in search_meals:
+        entries = diary.get(m_idx, [])
+        if not entries:
+            continue
+        results = match_foods_with_gpt(food_desc, entries)
+        if results and results[0].get("matches"):
+            found_entry = entries[results[0]["matches"][0]]
+            found_meal_idx = m_idx
+            break
+
+    if not found_entry:
+        return None, f"Couldn't find \"{food_desc}\" in your diary."
+
+    entry_id = found_entry.get("entry_id")
+    food_name = found_entry.get("name", food_desc)
+    meal_name = MEALS[found_meal_idx]["name"]
+
+    if not entry_id:
+        return None, f"Found {food_name} but couldn't get its entry ID to update it."
+
+    # Step 1: Remove the old entry
+    from myfitnesspal import remove_food as _remove_food
+    if not _remove_food(session, entry_id):
+        return None, f"Couldn't remove the existing {food_name} entry."
+
+    invalidate_recents_cache(found_meal_idx)
+
+    # Step 2: Re-search and re-log at the new quantity
+    query = normalize_food_query(food_name)
+    results, metadata = search_foods(session, query, found_meal_idx)
+    if not results:
+        return None, f"Removed {food_name} but couldn't find it again to re-log. Check MFP."
+
+    results = sorted(results, key=lambda r: (0 if not r.get("verified") else 1))
+    best, confidence = match_search_results_with_gpt(query, results)
+    if not best:
+        best = results[0]
+
+    qty_str = str(int(servings) if servings == int(servings) else servings)
+    if not log_searched_food(session, best, found_meal_idx, metadata, quantity=qty_str):
+        return None, f"Removed {food_name} but failed to re-log at {qty_str} servings."
+
+    invalidate_recents_cache(found_meal_idx)
+    macros = _format_macros(best.get("cal_info"))
+    return best["name"], f"Updated {food_name} to {qty_str} serving{'s' if servings != 1 else ''} in {meal_name}{macros}."
+
+
 def process_remove(session, food_desc, mentioned_meal):
     """Remove food(s) from diary in a single turn."""
     from datetime import date
@@ -392,6 +454,14 @@ def process_command(session, text):
         if quick_add_food(session, meal_idx, description, calories, protein, carbs, fat):
             return f"Quick added {description} to {meal_name}. {calories} calories."
         return "Something went wrong with the quick add."
+
+    # ── Update serving ──
+    if intent == "update_serving":
+        servings = parsed.get("servings")
+        if not servings or not food_desc:
+            return "Tell me which food and how many servings — e.g. \"change the khichdi to 2 servings\"."
+        _, msg = process_update_serving(session, food_desc, mentioned_meal, float(servings))
+        return msg
 
     # ── Remove ──
     if intent == "remove":

@@ -244,6 +244,44 @@ def process_preset_log(session, preset_name, meal_idx):
     return logged_names
 
 
+def _estimate_macros_with_llm(food_desc):
+    """Ask the LLM for typical macros for one standard serving of a food.
+    Returns (calories, protein, fat, carbs, serving_note) or None on failure.
+    """
+    import json
+    try:
+        response = client.chat.completions.create(
+            model=GPT_MODEL,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a nutrition expert. Given a food, return typical macros "
+                        "for ONE standard serving (e.g. 1 burrito, 1 cup, 1 slice). "
+                        "Return ONLY JSON with integer values: "
+                        '{"calories": N, "protein": N, "fat": N, "carbs": N, "serving": "1 burrito"}'
+                    ),
+                },
+                {"role": "user", "content": f"Food: {food_desc}"},
+            ],
+        )
+        raw = response.choices[0].message.content.strip()
+        data = json.loads(raw)
+        cal = int(data.get("calories", 0))
+        if cal <= 0:
+            return None
+        return (
+            cal,
+            float(data.get("protein", 0)),
+            float(data.get("fat", 0)),
+            float(data.get("carbs", 0)),
+            data.get("serving", "1 serving"),
+        )
+    except Exception:
+        return None
+
+
 def process_log(session, food_desc, meal_idx, prefer_custom=False):
     """Log foods in a single turn — auto-resolve disambiguation."""
     meal_name = MEALS[meal_idx]["name"]
@@ -281,6 +319,7 @@ def process_log(session, food_desc, meal_idx, prefer_custom=False):
         not_found_descs = split_food_descriptions(food_desc)
 
     # Step 2: Search MFP for anything not in recents
+    failed_parts = []  # parts that MFP couldn't match — will try LLM estimation
     for desc in not_found_descs:
         parts = split_compound_food_for_search(desc)
         for part in parts:
@@ -308,6 +347,10 @@ def process_log(session, food_desc, meal_idx, prefer_custom=False):
                     fallback = pick_reasonable_search_result(query, results)
                     if fallback:
                         pending_searched.append(fallback)
+                    else:
+                        failed_parts.append(part)
+            else:
+                failed_parts.append(part)
 
     # Step 3: Log everything
     if pending_foods:
@@ -321,6 +364,17 @@ def process_log(session, food_desc, meal_idx, prefer_custom=False):
 
     if logged_names:
         invalidate_recents_cache(meal_idx)
+
+    # Step 4: LLM estimation fallback for anything MFP couldn't find
+    for part in failed_parts:
+        print(f"  MFP had no match for \"{part}\" — estimating macros with LLM...")
+        est = _estimate_macros_with_llm(part)
+        if est:
+            cal, protein, fat, carbs, serving = est
+            if quick_add_food(session, meal_idx, part, cal, protein, carbs, fat):
+                macro_str = f" (~{cal} cal, {int(protein)}g prot, {int(fat)}g fat, {int(carbs)}g carbs — estimated)"
+                logged_names.append(part + macro_str)
+                invalidate_recents_cache(meal_idx)
 
     return logged_names
 

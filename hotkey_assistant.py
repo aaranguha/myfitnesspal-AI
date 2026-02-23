@@ -58,6 +58,7 @@ from assistant import (
     match_foods_with_gpt,
     match_search_results_with_gpt,
     normalize_food_query,
+    parse_nutrition_from_cal_info,
     parse_user_message,
     pick_meal_bundle_results,
     pick_reasonable_search_result,
@@ -155,6 +156,20 @@ def speak_synced(text, overlay_cmd, cancel_event=None):
 
 
 # ── Single-turn food logging ─────────────────────────────────────────────
+
+def _format_macros(cal_info):
+    """Return a short macro summary like ' (312 cal, 4g prot, 7g fat, 50g carbs)' or ''."""
+    n = parse_nutrition_from_cal_info(cal_info)
+    parts = []
+    if n.get("calories") is not None:
+        parts.append(f"{int(n['calories'])} cal")
+    if n.get("protein") is not None:
+        parts.append(f"{int(n['protein'])}g prot")
+    if n.get("fat") is not None:
+        parts.append(f"{int(n['fat'])}g fat")
+    if n.get("carbs") is not None:
+        parts.append(f"{int(n['carbs'])}g carbs")
+    return f" ({', '.join(parts)})" if parts else ""
 
 def process_preset_log(session, preset_name, meal_idx):
     """Log all foods in a named preset. Returns list of logged food names."""
@@ -265,11 +280,12 @@ def process_log(session, food_desc, meal_idx, prefer_custom=False):
     # Step 3: Log everything
     if pending_foods:
         if log_foods(session, pending_foods, all_foods, meal_idx, metadata):
-            logged_names.extend(f["name"] for f in pending_foods)
+            for f in pending_foods:
+                logged_names.append(f["name"] + _format_macros(f.get("cal_info")))
 
     for food in pending_searched:
         if log_searched_food(session, food, meal_idx, search_metadata):
-            logged_names.append(food["name"])
+            logged_names.append(food["name"] + _format_macros(food.get("cal_info")))
 
     if logged_names:
         invalidate_recents_cache(meal_idx)

@@ -447,7 +447,8 @@ def parse_user_message(user_message):
                     "\nIMPORTANT:\n"
                     "- Questions about what's LOGGED/in the diary (e.g. 'what did I log', 'what's in my dinner') = chat, NOT manage_meal.\n"
                     "- manage_meal is ONLY for meal PRESETS (saved combos), not the diary.\n"
-                    "- If the user mentions a saved preset name, use log_meal (not log).\n"
+                    "- log_meal is ONLY for explicitly named saved presets — use it ONLY when the user says 'my [name]' or 'the [name] meal/preset'. "
+                    "Generic food names like 'chipotle chicken bowl', 'oatmeal', 'rice and beans' are FOODS — use log (not log_meal) for them.\n"
                     "- If the user provides SPECIFIC calorie/macro numbers for a food, use quick_add (not log). "
                     'Put the food name in "foods" (e.g. "mod pizza"). If no food name given, use "Quick Add".\n'
                     "Return ONLY the JSON object, nothing else."

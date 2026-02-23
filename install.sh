@@ -197,8 +197,7 @@ if [[ "$START_NOW" =~ ^[Yy] ]]; then
   echo "  Running! Hold Option to speak, Option+Space to type."
   echo ""
   echo "  To start again later:"
-  echo "    cd $INSTALL_DIR && source venv/bin/activate && python hotkey_assistant.py &"
-  echo "    or: ./start.command"
+  echo "    cd $INSTALL_DIR && ./start.command"
 else
   echo ""
   echo "  No problem! To start later:"

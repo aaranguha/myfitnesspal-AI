@@ -43,9 +43,11 @@ from voice_io import FOOD_CONTEXT_PROMPT, transcribe_audio
 
 # Import assistant logic
 from assistant import (
+    GPT_MODEL,
     MEALS,
     MEAL_NAMES_TO_IDX,
     build_diary_context,
+    client,
     create_session,
     get_diary_details,
     get_recent_foods_cached,
@@ -74,6 +76,22 @@ from assistant import (
 from myfitnesspal import check_meals_logged, send_sms, send_sms_to, build_daily_summary, get_preset
 
 USER_NAME = os.getenv("USER_NAME", "Aaran")
+
+# ── Single-instance guard ─────────────────────────────────────────────────
+# Kill any other hotkey_assistant.py process before starting, so running
+# the script manually never creates duplicate listeners.
+_my_pid = os.getpid()
+try:
+    import signal as _signal
+    _procs = subprocess.check_output(
+        ["pgrep", "-f", "hotkey_assistant.py"], text=True
+    ).split()
+    for _pid_str in _procs:
+        _pid = int(_pid_str)
+        if _pid != _my_pid:
+            os.kill(_pid, _signal.SIGTERM)
+except Exception:
+    pass
 
 # Default reminder/summary config (can override via env or CLI args)
 DEFAULT_REMINDER_TIMES = os.getenv("REMINDER_TIMES", "09:30,13:30,19:30")
@@ -111,42 +129,56 @@ def speak_synced(text, overlay_cmd, cancel_event=None):
     import tempfile
     tmp = None
     proc = None
+    tts_ok = False
     try:
         tmp = tempfile.NamedTemporaryFile(suffix=".aiff", delete=False)
         tmp_path = tmp.name
         tmp.close()
 
         # Pre-render speech to file (fast, no audio output)
-        subprocess.run(
+        result = subprocess.run(
             ["say", "-o", tmp_path, text],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             timeout=10,
         )
+        tts_ok = (result.returncode == 0)
 
         if cancel_event and cancel_event.is_set():
             return
 
-        # Play audio — show overlay the instant playback begins
-        proc = subprocess.Popen(
-            ["afplay", tmp_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        overlay_cmd(f"result:{text}")
+        if tts_ok:
+            # Play audio — show overlay the instant playback begins
+            proc = subprocess.Popen(
+                ["afplay", tmp_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            overlay_cmd(f"result:{text}")
 
-        # Wait for audio, but bail immediately if cancelled
-        while proc.poll() is None:
-            if cancel_event and cancel_event.is_set():
-                proc.terminate()
-                return
-            time.sleep(0.05)
+            # Wait for audio, but bail immediately if cancelled
+            while proc.poll() is None:
+                if cancel_event and cancel_event.is_set():
+                    proc.terminate()
+                    return
+                time.sleep(0.05)
 
-        time.sleep(1.0)  # linger after voice ends
-        if not (cancel_event and cancel_event.is_set()):
+            time.sleep(1.0)  # linger after voice ends
+            if not (cancel_event and cancel_event.is_set()):
+                overlay_cmd("hide")
+        else:
+            # TTS failed — still show the response in the overlay for 4 seconds
+            overlay_cmd(f"result:{text}")
+            time.sleep(4.0)
             overlay_cmd("hide")
     except Exception:
         if proc:
             proc.terminate()
-        overlay_cmd("hide")
+        # Always show the result even if TTS crashed
+        try:
+            overlay_cmd(f"result:{text}")
+            time.sleep(4.0)
+            overlay_cmd("hide")
+        except Exception:
+            pass
     finally:
         if tmp:
             try:
@@ -359,9 +391,7 @@ def process_remove(session, food_desc, mentioned_meal):
     """Remove food(s) from diary in a single turn."""
     from datetime import date
     import json
-    from openai import OpenAI
 
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     diary, _ = get_diary_details(session, date.today())
 
     candidates = []
@@ -391,7 +421,7 @@ def process_remove(session, food_desc, mentioned_meal):
     # GPT match
     food_names_list = [f"{i}: {f['name']}" for i, f in enumerate(candidates)]
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model=GPT_MODEL,
         temperature=0,
         messages=[
             {

@@ -614,8 +614,8 @@ def build_daily_summary(session, target_date=None):
     def _check_goal(key, t, g):
         """Returns True if goal is met based on per-macro rules."""
         if key == "calories":
-            # Must be at or above goal, but not more than 300 over
-            return t >= g and t <= g + 300
+            # At least 2,200 cal is a pass regardless of MFP goal
+            return t >= 2200
         elif key == "protein":
             # Must hit or exceed goal
             return t >= g

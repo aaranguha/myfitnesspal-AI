@@ -89,7 +89,22 @@ try:
     for _pid_str in _procs:
         _pid = int(_pid_str)
         if _pid != _my_pid:
-            os.kill(_pid, _signal.SIGTERM)
+            try:
+                os.kill(_pid, _signal.SIGTERM)
+            except Exception:
+                pass
+    time.sleep(1)
+    # Force kill any that didn't respond to SIGTERM
+    _procs = subprocess.check_output(
+        ["pgrep", "-f", "hotkey_assistant.py"], text=True
+    ).split()
+    for _pid_str in _procs:
+        _pid = int(_pid_str)
+        if _pid != _my_pid:
+            try:
+                os.kill(_pid, _signal.SIGKILL)
+            except Exception:
+                pass
 except Exception:
     pass
 

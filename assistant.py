@@ -495,6 +495,9 @@ def match_foods_with_gpt(food_description, food_list):
                     "- 'chai' matches 'Chai Lucerne - Chai'\n"
                     '- "protein bar and chai" → two separate items\n'
                     '- "protein shake" with two shake options → one item with two matches\n'
+                    "- IMPORTANT: when the user uses a generic category name (e.g. 'protein bar', 'protein shake', "
+                    "'granola bar') and there are multiple entries in that category, return ALL of them as candidates — "
+                    "never guess between brands; let the user pick\n"
                     "- Return ONLY the JSON array, nothing else"
                 ),
             },

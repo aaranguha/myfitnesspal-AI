@@ -1034,11 +1034,19 @@ class PushToTalk:
                     if not space_pressed_during_option:
                         threading.Thread(target=self._stop_recording, daemon=True).start()
 
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        while True:
             try:
-                listener.join()
+                with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+                    listener.join()
+                # Listener exited cleanly (e.g. KeyboardInterrupt propagated) — stop
+                break
             except KeyboardInterrupt:
                 print("\n  Bye!")
+                break
+            except Exception as e:
+                print(f"  [watchdog] Key listener died ({e}), restarting in 2s...")
+                option_held = False
+                time.sleep(2)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────

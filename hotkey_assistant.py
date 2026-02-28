@@ -308,9 +308,9 @@ def process_log(session, food_desc, meal_idx, prefer_custom=False):
     pending_searched = []     # from MFP search
     search_metadata = None
 
-    # Step 1: Match against recents (skipped when user says "my X")
+    # Step 1: Match against recents
     not_found_descs = []
-    if all_foods and not prefer_custom:
+    if all_foods:
         print(f"  Checking {meal_name} recents...")
         match_results = match_foods_with_gpt(food_desc, all_foods)
 
@@ -344,8 +344,8 @@ def process_log(session, food_desc, meal_idx, prefer_custom=False):
             if s_meta and not search_metadata:
                 search_metadata = s_meta
             if results:
-                # Always sort custom (unverified) foods to the top
-                results = sorted(results, key=lambda r: (0 if not r.get("verified") else 1))
+                # Sort [mfp] verified entries first for cleaner GPT selection
+                results = sorted(results, key=lambda r: (0 if r.get("verified") else 1))
                 print(f"  [debug] Top results: " + " | ".join(
                     f"{'[custom]' if not r.get('verified') else '[mfp]'} {r['name']}"
                     for r in results[:5]

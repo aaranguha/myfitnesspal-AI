@@ -552,13 +552,16 @@ def match_search_results_with_gpt(food_description, search_results, prefer_custo
             'Return ONLY a JSON object: {"match": index_number, "confidence": "high"|"medium"|"low"}\n'
             'If nothing matches well, return: {"match": null, "confidence": "none"}\n\n'
             "Rules (in order of priority):\n"
-            "1. If any result's name exactly matches or very closely matches the description, pick it — even if tagged [custom]\n"
-            "2. [custom] entries are the user's own saved foods — strongly prefer them over [mfp] generic entries when the name matches\n"
-            "3. Only prefer [mfp] entries if no [custom] entry is a reasonable match\n"
-            "4. When two entries are equally close name matches, prefer the more descriptive one "
-            "(e.g. 'Homemade Khichdi Plain' over 'Khichdi', 'Brown Rice Cooked' over 'Rice') — "
-            "bare single-word names are often branded/packaged products with different macros than home-cooked food\n"
-            "5. Return ONLY the JSON object"
+            "1. Pick the result whose name best matches the food description\n"
+            "2. Strongly prefer [mfp] verified entries over [custom] user-submitted entries — "
+            "[custom] entries are random user submissions and are often mislabeled or irrelevant\n"
+            "3. Only pick a [custom] entry if its name is a significantly better match than any [mfp] entry\n"
+            "4. Reject nonsense or clearly unrelated entries (e.g. 'HH', single initials, gibberish) — "
+            "return null confidence if the best available match is clearly wrong\n"
+            "5. When two entries are equally close name matches, prefer the more descriptive one "
+            "(e.g. 'Homemade Khichdi Plain' over 'Khichdi') — "
+            "bare single-word names may have inaccurate macros\n"
+            "6. Return ONLY the JSON object"
         )
 
     response = client.chat.completions.create(
